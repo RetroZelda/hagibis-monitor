@@ -7,9 +7,9 @@ from math import gcd
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QLabel, QSlider, QComboBox, QCheckBox, QPushButton, QGroupBox,
-    QTabWidget, QTabBar, QScrollArea, QSizePolicy, QFrame,
+    QTabWidget, QTabBar, QScrollArea, QSizePolicy, QFrame, QColorDialog,
 )
-from PyQt6.QtCore import Qt, QRect, QSettings, QTimer
+from PyQt6.QtCore import Qt, QPoint, QRect, QSettings, QTimer
 from PyQt6.QtGui import QImage, QPixmap, QPainter, QColor, QFont, QPalette
 
 from workers import VideoWorker, AudioWorker
@@ -17,13 +17,15 @@ from vu_meter import StereoVuMeter
 
 # ── fallback tables used when v4l2-ctl is unavailable ───────────────────────
 _DEFAULT_RESOLUTIONS = [
-    ("2560×1440", 2560, 1440),
-    ("1920×1080", 1920, 1080),
-    ("1280×1024", 1280, 1024),
-    ("1280×720",  1280,  720),
-    ("1024×768",  1024,  768),
-    ("800×600",    800,  600),
-    ("640×480",    640,  480),
+    ("2560×1440", 2560, 1440),  # 16:9
+    ("1920×1080", 1920, 1080),  # 16:9
+    ("1280×1152", 1280, 1152),  # 10:9
+    ("1280×1024", 1280, 1024),  # 5:4
+    ("1280×720",  1280,  720),  # 16:9
+    ("1024×768",  1024,  768),  # 4:3
+    ("800×600",    800,  600),  # 4:3
+    ("640×576",    640,  576),  # 10:9
+    ("640×480",    640,  480),  # 4:3
 ]
 _DEFAULT_FRAMERATES = [60, 50, 30, 20, 10]
 _DEFAULT_FORMATS    = [("MJPEG", "mjpeg"), ("YUYV", "yuyv422")]
@@ -125,11 +127,26 @@ def _query_device_caps(dev: str) -> dict:
 class VideoDisplay(QLabel):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setMinimumSize(640, 360)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.setStyleSheet("background:#000;")
         self._pixmap: QPixmap | None = None
+        self._render_px: QPixmap | None = None
+        self._render_pt: QPoint = QPoint(0, 0)
+        self._scale_mode: str = "fit"
+        self._crop_mode: str = "full"
+        self._bg_color: QColor = QColor("#000000")
+
+    def set_scale_mode(self, mode: str):
+        self._scale_mode = mode
+        self._refresh()
+
+    def set_crop_mode(self, mode: str):
+        self._crop_mode = mode
+        self._refresh()
+
+    def set_bg_color(self, color: QColor):
+        self._bg_color = color
+        self.update()
 
     def set_frame(self, img: QImage):
         self._pixmap = QPixmap.fromImage(img)
@@ -137,29 +154,85 @@ class VideoDisplay(QLabel):
 
     def clear_signal(self):
         self._pixmap = None
+        self._render_px = None
         self.update()
 
+    def _cropped(self, px: QPixmap) -> QPixmap:
+        if self._crop_mode == "full":
+            return px
+        try:
+            rw, rh = (int(p) for p in self._crop_mode.split(":"))
+        except ValueError:
+            return px
+        sw, sh = px.width(), px.height()
+        if sw == 0 or sh == 0:
+            return px
+        tgt = rw / rh
+        src = sw / sh
+        if abs(src - tgt) < 0.001:
+            return px
+        if src > tgt:
+            nw = int(sh * tgt)
+            return px.copy((sw - nw) // 2, 0, nw, sh)
+        else:
+            nh = int(sw / tgt)
+            return px.copy(0, (sh - nh) // 2, sw, nh)
+
     def _refresh(self):
-        if self._pixmap:
-            scaled = self._pixmap.scaled(
-                self.size(),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.FastTransformation,
+        if not self._pixmap:
+            self._render_px = None
+            self.update()
+            return
+        px   = self._cropped(self._pixmap)
+        W, H = self.width(), self.height()
+        if W == 0 or H == 0:
+            return
+        fast = Qt.TransformationMode.FastTransformation
+        mode = self._scale_mode
+
+        if mode == "stretch":
+            self._render_px = px.scaled(W, H, Qt.AspectRatioMode.IgnoreAspectRatio, fast)
+            self._render_pt = QPoint(0, 0)
+        elif mode == "fill":
+            s = px.scaled(W, H, Qt.AspectRatioMode.KeepAspectRatioByExpanding, fast)
+            self._render_px = s.copy(
+                max(0, (s.width() - W) // 2), max(0, (s.height() - H) // 2), W, H
             )
-            self.setPixmap(scaled)
+            self._render_pt = QPoint(0, 0)
+        elif mode == "native":
+            self._render_px = px
+            self._render_pt = QPoint(max(0, (W - px.width()) // 2),
+                                     max(0, (H - px.height()) // 2))
+        elif mode.startswith("area_"):
+            # e.g. "area_16_9" → constrain output to a 16:9 sub-rect
+            rw, rh = (int(v) for v in mode[5:].split("_"))
+            scale  = min(W / rw, H / rh)
+            aw, ah = int(rw * scale), int(rh * scale)
+            s = px.scaled(aw, ah, Qt.AspectRatioMode.KeepAspectRatio, fast)
+            self._render_px = s
+            self._render_pt = QPoint((W - s.width()) // 2, (H - s.height()) // 2)
+        else:  # "fit"
+            s = px.scaled(W, H, Qt.AspectRatioMode.KeepAspectRatio, fast)
+            self._render_px = s
+            self._render_pt = QPoint((W - s.width()) // 2, (H - s.height()) // 2)
+
+        self.update()
 
     def resizeEvent(self, event):
         self._refresh()
 
     def paintEvent(self, event):
-        if self._pixmap is None:
-            p = QPainter(self)
-            p.fillRect(self.rect(), QColor("#0d0d0d"))
-            p.setPen(QColor("#404040"))
+        p = QPainter(self)
+        p.fillRect(self.rect(), self._bg_color)
+        if self._render_px is not None:
+            p.drawPixmap(self._render_pt, self._render_px)
+        else:
+            lum = (0.299 * self._bg_color.redF() +
+                   0.587 * self._bg_color.greenF() +
+                   0.114 * self._bg_color.blueF())
+            p.setPen(QColor("#404040") if lum > 0.5 else QColor("#606060"))
             p.setFont(QFont("sans-serif", 20))
             p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "NO SIGNAL")
-        else:
-            super().paintEvent(event)
 
 
 # ── helper: labelled slider row ───────────────────────────────────────────────
@@ -309,6 +382,45 @@ class MainWindow(QMainWindow):
         apply_btn.clicked.connect(self._restart_video)
         cl.addWidget(apply_btn)
         layout.addWidget(cap)
+
+        # ── Display ───────────────────────────────────────────────────────
+        disp = QGroupBox("Display")
+        dl = QVBoxLayout(disp)
+        dl.addWidget(QLabel("Scale Mode:"))
+        self._scale_combo = QComboBox()
+        for label, key in [
+            ("Fit (Keep Aspect)",   "fit"),
+            ("Stretch to Fill",     "stretch"),
+            ("Zoom to Fill (Crop)", "fill"),
+            ("Native (1:1 Pixels)", "native"),
+            ("Fit to 16:9 Area",    "area_16_9"),
+            ("Fit to 10:9 Area",    "area_10_9"),
+            ("Fit to 5:4 Area",     "area_5_4"),
+            ("Fit to 4:3 Area",     "area_4_3"),
+        ]:
+            self._scale_combo.addItem(label, key)
+        self._scale_combo.currentIndexChanged.connect(self._on_scale_mode_changed)
+        dl.addWidget(self._scale_combo)
+
+        dl.addWidget(QLabel("Crop:"))
+        self._crop_combo = QComboBox()
+        for label, key in [
+            ("Full Image",   "full"),
+            ("Crop to 10:9", "10:9"),
+            ("Crop to 5:4",  "5:4"),
+            ("Crop to 4:3",  "4:3"),
+        ]:
+            self._crop_combo.addItem(label, key)
+        self._crop_combo.currentIndexChanged.connect(self._on_crop_mode_changed)
+        dl.addWidget(self._crop_combo)
+
+        dl.addWidget(QLabel("Background Color:"))
+        self._bg_color_btn = QPushButton()
+        self._bg_color_btn.setFixedHeight(26)
+        self._bg_color_btn.setToolTip("Click to choose background colour")
+        self._bg_color_btn.clicked.connect(self._pick_bg_color)
+        dl.addWidget(self._bg_color_btn)
+        layout.addWidget(disp)
 
         # ── Image controls ────────────────────────────────────────────────
         img = QGroupBox("Image Controls")
@@ -652,6 +764,30 @@ class MainWindow(QMainWindow):
         self._populate_fmt_combo()
         self._load_video_device_settings(dev)
 
+    def _on_scale_mode_changed(self):
+        self._display.set_scale_mode(self._scale_combo.currentData())
+        self._save_settings()
+
+    def _on_crop_mode_changed(self):
+        self._display.set_crop_mode(self._crop_combo.currentData())
+        self._save_settings()
+
+    def _pick_bg_color(self):
+        color = QColorDialog.getColor(
+            self._display._bg_color, self, "Choose Background Color"
+        )
+        if color.isValid():
+            self._apply_bg_color(color)
+            self._save_settings()
+
+    def _apply_bg_color(self, color: QColor):
+        self._display.set_bg_color(color)
+        self._bg_color_btn.setStyleSheet(
+            f"background: {color.name()};"
+            f"border: 1px solid #555;"
+            f"border-radius: 3px;"
+        )
+
     def _refresh_video_devices(self):
         current = self._device_combo.currentData()
         self._video_devices = _scan_video_devices()
@@ -693,10 +829,10 @@ class MainWindow(QMainWindow):
             self._save_audio_device_settings(self._current_audio_dev)
         dev = self._audio_device_combo.currentData() or "plughw:Hagibis,0"
         self._current_audio_dev = dev
-        QSettings("HagibisMonitor", "HagibisMonitor").setValue("audio/device", dev)
         self._load_audio_device_settings(dev)
         if self._audio_enabled.isChecked():
             self._start_audio()
+        self._save_settings()
 
     def _refresh_audio_devices(self):
         current = self._audio_device_combo.currentData()
@@ -724,6 +860,19 @@ class MainWindow(QMainWindow):
         panel_visible = s.value("window/panel_visible", True, type=bool)
         self._panel_scroll.setVisible(panel_visible)
         self._panel_toggle.setText("◀" if panel_visible else "▶")
+        saved_mode = s.value("display/scale_mode", "fit")
+        for i in range(self._scale_combo.count()):
+            if self._scale_combo.itemData(i) == saved_mode:
+                self._scale_combo.setCurrentIndex(i)
+                break
+        self._display.set_scale_mode(self._scale_combo.currentData())
+        saved_crop = s.value("display/crop_mode", "full")
+        for i in range(self._crop_combo.count()):
+            if self._crop_combo.itemData(i) == saved_crop:
+                self._crop_combo.setCurrentIndex(i)
+                break
+        self._display.set_crop_mode(self._crop_combo.currentData())
+        self._apply_bg_color(QColor(s.value("display/bg_color", "#000000")))
 
         # Video device — block signal, set index, then call handler explicitly
         self._device_combo.blockSignals(True)
@@ -747,7 +896,7 @@ class MainWindow(QMainWindow):
 
         # Audio enabled (block signal, restore, then start manually if needed)
         self._audio_enabled.blockSignals(True)
-        self._audio_enabled.setChecked(s.value("audio/enabled", False, type=bool))
+        self._audio_enabled.setChecked(s.value("audio/enabled", True, type=bool))
         self._audio_enabled.blockSignals(False)
         self._update_vol_slider_states()
         if self._audio_enabled.isChecked():
@@ -758,6 +907,9 @@ class MainWindow(QMainWindow):
         s.setValue("window/geometry",      self.saveGeometry())
         s.setValue("window/state",         self.saveState())
         s.setValue("window/panel_visible", self._panel_scroll.isVisible())
+        s.setValue("display/scale_mode",   self._scale_combo.currentData())
+        s.setValue("display/crop_mode",    self._crop_combo.currentData())
+        s.setValue("display/bg_color",     self._display._bg_color.name())
         s.setValue("cap/device",      self._device_combo.currentData() or "/dev/video0")
         s.setValue("audio/device",    self._audio_device_combo.currentData() or "plughw:Hagibis,0")
         s.setValue("audio/enabled",   self._audio_enabled.isChecked())
