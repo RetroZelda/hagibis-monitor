@@ -7,6 +7,10 @@ V4L2-compatible capture device.
 
 ---
 
+<img width="1603" height="1240" alt="image" src="https://github.com/user-attachments/assets/0dd4d44a-c5e4-4395-b7e1-b8197bd61642" />
+
+---
+
 ## Table of Contents
 
 1. [Hardware context](#hardware-context)
