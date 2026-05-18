@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# VS Code — keep launch.json and settings.json, ignore workspace-local state
+.vscode/extensions.json
+
+# PyInstaller
+*.spec
+dist/
+build/
+
+# Byte-compiled / optimised
+*.pyc
+
+# Distribution / packaging
+*.tar.gz
+*.whl
+
+# pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# mypy / pyright
+.mypy_cache/
+.pyright/
+pyrightconfig.json
+
+# OS
+.DS_Store
+Thumbs.db
