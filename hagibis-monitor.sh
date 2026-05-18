@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+
+# This was the original script I made in order to see and hear the output.  
+# Its only in this repo for reference and backup and generally shouldnt need to be used
+
 set -euo pipefail
 
 # ==================== CONFIGURATION ====================
