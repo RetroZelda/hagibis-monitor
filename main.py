@@ -37,7 +37,6 @@ _DEFAULT_FORMATS    = [("MJPEG", "mjpeg"), ("YUYV", "yuyv422")]
 # ── settings dataclass ────────────────────────────────────────────────────────
 @dataclass
 class AppSettings:
-    panel_visible: bool  = True
     scale_mode:    str   = "fit"
     crop_mode:     str   = "full"
     bg_color:      str   = "#1f1f1f"
@@ -685,7 +684,6 @@ class MainWindow(QMainWindow):
     def _collect_settings(self) -> AppSettings:
         w, h = self._res_combo.currentData() or (1280, 720)
         return AppSettings(
-            panel_visible = self._panel_scroll.isVisible(),
             scale_mode    = self._scale_combo.currentData() or "fit",
             crop_mode     = self._crop_combo.currentData() or "full",
             bg_color      = self._display._bg_color.name(),
@@ -749,7 +747,6 @@ class MainWindow(QMainWindow):
                 return default
 
         return AppSettings(
-            panel_visible = _b("window/panel_visible", True),
             scale_mode    = _s("display/scale_mode", "fit"),
             crop_mode     = _s("display/crop_mode", "full"),
             bg_color      = _s("display/bg_color", "#1f1f1f"),
@@ -772,7 +769,6 @@ class MainWindow(QMainWindow):
 
     def _save_to_disk(self, settings: AppSettings, name: str):
         s = self._profile_settings(name)
-        s.setValue("window/panel_visible", settings.panel_visible)
         s.setValue("display/scale_mode",   settings.scale_mode)
         s.setValue("display/crop_mode",    settings.crop_mode)
         s.setValue("display/bg_color",     settings.bg_color)
@@ -795,10 +791,6 @@ class MainWindow(QMainWindow):
 
     def _apply_settings(self, settings: AppSettings):
         """Apply an AppSettings struct to all UI widgets then restart streams."""
-        # Panel
-        self._panel_scroll.setVisible(settings.panel_visible)
-        self._panel_toggle.setText("◀" if settings.panel_visible else "▶")
-
         # Scale / crop / bg
         self._select_combo(self._scale_combo, settings.scale_mode)
         self._display.set_scale_mode(settings.scale_mode)
@@ -992,6 +984,9 @@ class MainWindow(QMainWindow):
         state = gs.value("window/state")
         if state:
             self.restoreState(state)
+        panel_visible = gs.value("window/panel_visible", True, type=bool)
+        self._panel_scroll.setVisible(panel_visible)
+        self._panel_toggle.setText("◀" if panel_visible else "▶")
 
         # Migrate old flat settings into Default.ini if it doesn't exist yet
         if not self._profile_path("Default").exists():
@@ -1009,9 +1004,10 @@ class MainWindow(QMainWindow):
 
     def _save_global(self):
         gs = QSettings("HagibisMonitor", "HagibisMonitor")
-        gs.setValue("window/geometry", self.saveGeometry())
-        gs.setValue("window/state",    self.saveState())
-        gs.setValue("profile/current", self._current_profile)
+        gs.setValue("window/geometry",     self.saveGeometry())
+        gs.setValue("window/state",        self.saveState())
+        gs.setValue("window/panel_visible", self._panel_scroll.isVisible())
+        gs.setValue("profile/current",     self._current_profile)
 
     # ── dynamic combo population ──────────────────────────────────────────────
     def _populate_fmt_combo(self):
@@ -1314,7 +1310,7 @@ class MainWindow(QMainWindow):
         visible = not self._panel_scroll.isVisible()
         self._panel_scroll.setVisible(visible)
         self._panel_toggle.setText("◀" if visible else "▶")
-        self._mark_dirty()
+        self._save_global()
 
     # ── window close ──────────────────────────────────────────────────────────
     def closeEvent(self, event):
