@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Hagibis Monitor
+GenericName=Capture Card Monitor
+Comment=Live monitor and control for USB capture cards
+Exec=hagibis-monitor
+Icon=video-display
+Terminal=false
+Categories=AudioVideo;Video;Monitor;
+Keywords=capture;hdmi;video;monitor;hagibis;
+StartupNotify=true

@@ -12,6 +12,7 @@ build/
 
 # Virtual environments
 .venv/
+.venv-build/
 venv/
 env/
 ENV/
@@ -19,8 +20,7 @@ ENV/
 # VS Code — keep launch.json and settings.json, ignore workspace-local state
 .vscode/extensions.json
 
-# PyInstaller
-*.spec
+# PyInstaller — track the spec, ignore build output
 dist/
 build/
 
