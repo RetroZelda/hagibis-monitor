@@ -112,7 +112,8 @@ class AudioWorker(QThread):
         return self._proc.pid if self._proc else None
 
     def _build_cmd(self) -> list[str]:
-        base = ["ffmpeg", "-loglevel", "quiet", "-f", "alsa", "-i", self.device]
+        fmt = "alsa" if self.device.startswith(("hw:", "plughw:")) else "pulse"
+        base = ["ffmpeg", "-loglevel", "quiet", "-f", fmt, "-i", self.device]
 
         if self.passthrough:
             mono_prefix = "pan=stereo|c0=0.5*c0+0.5*c1|c1=0.5*c0+0.5*c1," if self.mono_mix else ""

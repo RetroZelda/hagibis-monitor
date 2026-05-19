@@ -89,6 +89,29 @@ def _scan_video_devices() -> list[tuple[str, str]]:
 
 
 def _scan_audio_devices() -> list[tuple[str, str]]:
+    # Prefer PulseAudio/PipeWire sources — works even when PipeWire owns ALSA
+    try:
+        out = subprocess.check_output(
+            ["pactl", "list", "sources"], stderr=subprocess.DEVNULL, timeout=3,
+        ).decode(errors="replace")
+        devices, name, desc = [], None, None
+        for line in out.splitlines():
+            line = line.strip()
+            m = re.match(r"Name:\s+(.+)", line)
+            if m:
+                name, desc = m.group(1), None
+                continue
+            m = re.match(r"Description:\s+(.+)", line)
+            if m:
+                desc = m.group(1)
+                if name and not name.endswith(".monitor"):
+                    devices.append((desc, name))
+        if devices:
+            return devices
+    except Exception:
+        pass
+
+    # Fall back to direct ALSA
     try:
         out = subprocess.check_output(
             ["arecord", "-l"], stderr=subprocess.DEVNULL, timeout=2,
@@ -405,6 +428,9 @@ class MainWindow(QMainWindow):
         cl.addWidget(QLabel("Device:"))
         self._video_devices = _scan_video_devices()
         self._device_combo = QComboBox()
+        self._device_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
         for label, path in self._video_devices:
             self._device_combo.addItem(label, path)
         refresh_btn = QPushButton("↻")
@@ -522,6 +548,9 @@ class MainWindow(QMainWindow):
         dl = QVBoxLayout(dev_grp)
         self._audio_devices = _scan_audio_devices()
         self._audio_device_combo = QComboBox()
+        self._audio_device_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
         for label, path in self._audio_devices:
             self._audio_device_combo.addItem(label, path)
         audio_refresh_btn = QPushButton("↻")
