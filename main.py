@@ -312,6 +312,7 @@ class MainWindow(QMainWindow):
         self._pa_poll_count:  int = 0
         self._current_profile: str  = "Default"
         self._dirty:           bool = False
+        self._res_tab_selection: dict[str, tuple[int, int]] = {}
 
         self._build_ui()
         self._apply_dark_theme()
@@ -848,6 +849,7 @@ class MainWindow(QMainWindow):
                 self._res_aspect_bar.setCurrentIndex(i)
                 break
         self._res_aspect_bar.blockSignals(False)
+        self._res_tab_selection[target_aspect] = (rw, rh)
         self._fill_res_combo_for_tab()
         self._select_combo_by_data(self._res_combo, (rw, rh))
         self._populate_fps_combo()
@@ -1085,6 +1087,12 @@ class MainWindow(QMainWindow):
             label = self._res_aspect_bar.tabText(tab_idx)
             for w, h in self._res_aspect_groups.get(label, []):
                 self._res_combo.addItem(f"{w}×{h}", (w, h))
+            saved = self._res_tab_selection.get(label)
+            if saved:
+                for i in range(self._res_combo.count()):
+                    if self._res_combo.itemData(i) == saved:
+                        self._res_combo.setCurrentIndex(i)
+                        break
         self._res_combo.blockSignals(False)
 
     def _on_res_aspect_changed(self):
@@ -1110,6 +1118,12 @@ class MainWindow(QMainWindow):
         self._mark_dirty()
 
     def _on_res_changed(self):
+        tab_idx = self._res_aspect_bar.currentIndex()
+        if tab_idx >= 0:
+            label = self._res_aspect_bar.tabText(tab_idx)
+            data = self._res_combo.currentData()
+            if data:
+                self._res_tab_selection[label] = data
         self._populate_fps_combo()
         self._mark_dirty()
 
