@@ -69,9 +69,6 @@ class OutputSettings:
     height:       int   = 1080
     pixel_format: str   = "yuyv422"
     fps:          int   = 30
-    pan_x:        float = 0.0
-    pan_y:        float = 0.0
-    zoom:         float = 1.0
 
 
 @dataclass
@@ -96,6 +93,10 @@ class AppSettings:
     volume_db:     int   = 0
     volume_l_db:   int   = 0
     volume_r_db:   int   = 0
+    # Output pan / zoom
+    pan_x:         float = 0.0
+    pan_y:         float = 0.0
+    zoom:          float = 1.0
 
 
 # ── module-level helpers ──────────────────────────────────────────────────────
@@ -528,17 +529,12 @@ class VideoDisplay(QLabel):
 class _ModprobeWorker(QThread):
     done = pyqtSignal(str, bool)  # (device_path_or_empty, loaded_by_us)
 
-    def __init__(self, unload: bool = False):
+    def __init__(self):
         super().__init__()
-        self._unload = unload
 
     def run(self):
-        if self._unload:
-            _unload_v4l2loopback()
-            self.done.emit("", False)
-        else:
-            dev, by_us = _load_v4l2loopback()
-            self.done.emit(dev, by_us)
+        dev, by_us = _load_v4l2loopback()
+        self.done.emit(dev, by_us)
 
 
 # ── status bar ────────────────────────────────────────────────────────────────
@@ -629,7 +625,6 @@ class MainWindow(QMainWindow):
         self._output_worker:   OutputWorker   | None = None
         self._modprobe_worker: _ModprobeWorker | None = None
         self._v4l2_device:       str  = ""
-        self._v4l2_loaded_by_us: bool = False
         self._caps:           dict = {}
         self._pa_sink_input:  int | None = None
         self._pa_poll_count:  int = 0
@@ -1202,6 +1197,9 @@ class MainWindow(QMainWindow):
             volume_db     = self._vol_slider.value(),
             volume_l_db   = self._vol_l_slider.value(),
             volume_r_db   = self._vol_r_slider.value(),
+            pan_x         = self._display._pan_x,
+            pan_y         = self._display._pan_y,
+            zoom          = self._display._zoom,
         )
 
     def _load_from_disk(self, name: str) -> AppSettings:
@@ -1265,6 +1263,9 @@ class MainWindow(QMainWindow):
             volume_db     = aud("volume_db",   0,     int),
             volume_l_db   = aud("volume_l_db", 0,     int),
             volume_r_db   = aud("volume_r_db", 0,     int),
+            pan_x         = float(_s("output/pan_x", 0.0) or 0.0),
+            pan_y         = float(_s("output/pan_y", 0.0) or 0.0),
+            zoom          = float(_s("output/zoom",  1.0) or 1.0),
         )
 
     def _save_to_disk(self, settings: AppSettings, name: str):
@@ -1287,6 +1288,9 @@ class MainWindow(QMainWindow):
         s.setValue("audio/volume_db",      settings.volume_db)
         s.setValue("audio/volume_l_db",    settings.volume_l_db)
         s.setValue("audio/volume_r_db",    settings.volume_r_db)
+        s.setValue("output/pan_x",         settings.pan_x)
+        s.setValue("output/pan_y",         settings.pan_y)
+        s.setValue("output/zoom",          settings.zoom)
         s.sync()
 
     def _apply_settings(self, settings: AppSettings):
@@ -1360,6 +1364,12 @@ class MainWindow(QMainWindow):
         self._vol_l_lbl.setText(_db_label(settings.volume_l_db))
         self._vol_r_lbl.setText(_db_label(settings.volume_r_db))
         self._update_vol_slider_states()
+
+        # Pan / zoom
+        self._display.set_pan_zoom(settings.pan_x, settings.pan_y, settings.zoom)
+        self._out_pan_x_lbl.setText(f"{settings.pan_x:.1f}")
+        self._out_pan_y_lbl.setText(f"{settings.pan_y:.1f}")
+        self._out_zoom_lbl.setText(f"{settings.zoom:.2f}×")
 
         # Restart streams
         self._restart_video()
@@ -1799,21 +1809,15 @@ class MainWindow(QMainWindow):
                 self._on_v4l2_loaded(selected, False)
             else:
                 self._lbl_signal.setText("Loading v4l2loopback…")
-                worker = _ModprobeWorker(unload=False)
+                worker = _ModprobeWorker()
                 worker.done.connect(self._on_v4l2_loaded)
                 self._modprobe_worker = worker
                 worker.start()
         else:
             self._stop_output()
+            self._v4l2_device = ""
             w, h = self._out_res_combo.currentData() or (1920, 1080)
             self._display.set_output_mode(False, w, h)
-            if self._v4l2_device:
-                worker = _ModprobeWorker(unload=True)
-                worker.done.connect(lambda *_: None)
-                self._modprobe_worker = worker
-                worker.start()
-                self._v4l2_device = ""
-                self._v4l2_loaded_by_us = False
             if self._audio_enabled.isChecked():
                 self._start_audio()
             self._update_output_status()
@@ -1822,7 +1826,6 @@ class MainWindow(QMainWindow):
     def _on_v4l2_loaded(self, dev: str, loaded_by_us: bool):
         if dev:
             self._v4l2_device = dev
-            self._v4l2_loaded_by_us = loaded_by_us
             self._populate_output_video_combo(dev)
             w, h = self._out_res_combo.currentData() or (1920, 1080)
             self._display.set_output_mode(True, w, h)
@@ -1864,13 +1867,13 @@ class MainWindow(QMainWindow):
         self._out_pan_x_lbl.setText("0.0")
         self._out_pan_y_lbl.setText("0.0")
         self._out_zoom_lbl.setText("1.00×")
-        self._save_output_settings()
+        self._mark_dirty()
 
     def _on_output_changed(self, pan_x: float, pan_y: float, zoom: float):
         self._out_pan_x_lbl.setText(f"{pan_x:.1f}")
         self._out_pan_y_lbl.setText(f"{pan_y:.1f}")
         self._out_zoom_lbl.setText(f"{zoom:.2f}×")
-        self._save_output_settings()
+        self._mark_dirty()
 
     # ── output stream management ──────────────────────────────────────────────
 
@@ -1914,9 +1917,6 @@ class MainWindow(QMainWindow):
         def _i(k, d):
             try: return int(gs.value(f"output/{k}", d))
             except (TypeError, ValueError): return d
-        def _f(k, d):
-            try: return float(gs.value(f"output/{k}", d))
-            except (TypeError, ValueError): return d
         def _s(k, d):
             v = gs.value(f"output/{k}"); return v if v is not None else d
 
@@ -1927,9 +1927,6 @@ class MainWindow(QMainWindow):
             height       = _i("height",        1080),
             pixel_format = _s("pixel_format",  "yuyv422"),
             fps          = _i("fps",           30),
-            pan_x        = _f("pan_x",         0.0),
-            pan_y        = _f("pan_y",         0.0),
-            zoom         = _f("zoom",          1.0),
         )
 
     def _apply_output_settings_to_ui(self):
@@ -1956,17 +1953,11 @@ class MainWindow(QMainWindow):
         self._select_combo(self._out_pix_fmt_combo, os.pixel_format)
         self._select_combo_by_data(self._out_fps_combo, os.fps)
 
-        self._display.set_pan_zoom(os.pan_x, os.pan_y, os.zoom)
-        self._out_pan_x_lbl.setText(f"{os.pan_x:.1f}")
-        self._out_pan_y_lbl.setText(f"{os.pan_y:.1f}")
-        self._out_zoom_lbl.setText(f"{os.zoom:.2f}×")
-
         self._out_enabled.blockSignals(True)
         self._out_enabled.setChecked(False)
         self._out_enabled.blockSignals(False)
 
     def _save_output_settings(self):
-        pan_x, pan_y, zoom = self._display.get_pan_zoom()
         w, h = self._out_res_combo.currentData() or (1920, 1080)
         gs = QSettings("HagibisMonitor", "HagibisMonitor")
         gs.setValue("output/enabled",      self._out_enabled.isChecked())
@@ -1975,9 +1966,6 @@ class MainWindow(QMainWindow):
         gs.setValue("output/height",       h)
         gs.setValue("output/pixel_format", self._out_pix_fmt_combo.currentData() or "yuyv422")
         gs.setValue("output/fps",          self._out_fps_combo.currentData() or 30)
-        gs.setValue("output/pan_x",        pan_x)
-        gs.setValue("output/pan_y",        pan_y)
-        gs.setValue("output/zoom",         zoom)
         gs.sync()
 
     def _update_vol_slider_states(self):
@@ -2070,9 +2058,6 @@ class MainWindow(QMainWindow):
         self._stop_output()
         self._stop_audio()
         self._stop_video()
-        if self._v4l2_device:
-            _unload_v4l2loopback()
-            self._v4l2_device = ""
         event.accept()
 
 
