@@ -105,8 +105,9 @@ class OutputWorker(QThread):
         self._q: queue.Queue = queue.Queue(maxsize=4)
         self._running = False
 
-    def push_frame(self, img: QImage, pan_x: float, pan_y: float, zoom: float, bg: QColor):
-        item = (img, pan_x, pan_y, zoom, bg)
+    def push_frame(self, img: QImage, pan_x: float, pan_y: float, zoom: float,
+                   bg: QColor, scale_mode: str = "fit", crop_mode: str = "full"):
+        item = (img, pan_x, pan_y, zoom, bg, scale_mode, crop_mode)
         if self._q.full():
             try:
                 self._q.get_nowait()
@@ -166,8 +167,8 @@ class OutputWorker(QThread):
             if sleep_for > 0:
                 time.sleep(sleep_for)
 
-            src, pan_x, pan_y, zoom, bg = last_item
-            data = self._render(src, pan_x, pan_y, zoom, bg)
+            src, pan_x, pan_y, zoom, bg, scale_mode, crop_mode = last_item
+            data = self._render(src, pan_x, pan_y, zoom, bg, scale_mode, crop_mode)
             try:
                 proc.stdin.write(data)
             except (BrokenPipeError, OSError):
@@ -188,20 +189,67 @@ class OutputWorker(QThread):
         except subprocess.TimeoutExpired:
             proc.kill()
 
-    def _render(self, src: QImage, pan_x: float, pan_y: float, zoom: float, bg: QColor) -> bytes:
+    @staticmethod
+    def _crop(img: QImage, crop_mode: str) -> QImage:
+        if crop_mode == "full":
+            return img
+        try:
+            rw, rh = (int(p) for p in crop_mode.split(":"))
+        except ValueError:
+            return img
+        sw, sh = img.width(), img.height()
+        if sw == 0 or sh == 0:
+            return img
+        tgt = rw / rh
+        src_ar = sw / sh
+        if abs(src_ar - tgt) < 0.001:
+            return img
+        if src_ar > tgt:
+            nw = int(sh * tgt)
+            return img.copy((sw - nw) // 2, 0, nw, sh)
+        else:
+            nh = int(sw / tgt)
+            return img.copy(0, (sh - nh) // 2, sw, nh)
+
+    def _render(self, src: QImage, pan_x: float, pan_y: float, zoom: float,
+                bg: QColor, scale_mode: str, crop_mode: str) -> bytes:
         out = QImage(self._width, self._height, QImage.Format.Format_RGB888)
         out.fill(bg)
+        src = self._crop(src, crop_mode)
         src_w, src_h = src.width(), src.height()
+        W, H = self._width, self._height
         if src_w > 0 and src_h > 0:
-            fit = min(self._width / src_w, self._height / src_h)
-            dw = max(1, int(src_w * fit * zoom))
-            dh = max(1, int(src_h * fit * zoom))
-            dx = int((self._width - dw) / 2 + pan_x)
-            dy = int((self._height - dh) / 2 + pan_y)
-            scaled = src.scaled(dw, dh,
-                                Qt.AspectRatioMode.IgnoreAspectRatio,
-                                Qt.TransformationMode.SmoothTransformation)
+            smooth  = Qt.TransformationMode.SmoothTransformation
+            ignore  = Qt.AspectRatioMode.IgnoreAspectRatio
+            clip    = False
+
+            if scale_mode == "stretch":
+                dw, dh = max(1, int(W * zoom)), max(1, int(H * zoom))
+            elif scale_mode == "fill":
+                s = max(W / src_w, H / src_h) * zoom
+                dw, dh = max(1, int(src_w * s)), max(1, int(src_h * s))
+                clip = True
+            elif scale_mode == "native":
+                dw, dh = max(1, int(src_w * zoom)), max(1, int(src_h * zoom))
+            elif scale_mode.startswith("area_"):
+                rw, rh = (int(v) for v in scale_mode[5:].split("_"))
+                as_ = min(W / rw, H / rh)
+                s   = min(rw * as_ / src_w, rh * as_ / src_h) * zoom
+                dw, dh = max(1, int(src_w * s)), max(1, int(src_h * s))
+            elif scale_mode.startswith("stretch_"):
+                rw, rh = (int(v) for v in scale_mode[8:].split("_"))
+                as_ = min(W / rw, H / rh)
+                dw, dh = max(1, int(rw * as_ * zoom)), max(1, int(rh * as_ * zoom))
+            else:  # "fit"
+                s = min(W / src_w, H / src_h) * zoom
+                dw, dh = max(1, int(src_w * s)), max(1, int(src_h * s))
+
+            dx = int((W - dw) / 2 + pan_x)
+            dy = int((H - dh) / 2 + pan_y)
+            scaled = src.scaled(dw, dh, ignore, smooth)
             p = QPainter(out)
+            if clip:
+                p.setClipRect(0, 0, W, H)
             p.drawImage(dx, dy, scaled)
             p.end()
         ptr = out.bits()

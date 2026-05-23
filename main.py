@@ -93,10 +93,12 @@ class AppSettings:
     volume_db:     int   = 0
     volume_l_db:   int   = 0
     volume_r_db:   int   = 0
-    # Output pan / zoom
-    pan_x:         float = 0.0
-    pan_y:         float = 0.0
-    zoom:          float = 1.0
+    # Output scale / crop / pan / zoom
+    output_scale_mode: str   = "fit"
+    output_crop_mode:  str   = "full"
+    pan_x:             float = 0.0
+    pan_y:             float = 0.0
+    zoom:              float = 1.0
 
 
 # ── module-level helpers ──────────────────────────────────────────────────────
@@ -290,8 +292,10 @@ class VideoDisplay(QLabel):
         self._pixmap:    QPixmap | None = None
         self._render_px: QPixmap | None = None
         self._render_pt: QPoint = QPoint(0, 0)
-        self._scale_mode: str = "fit"
-        self._crop_mode:  str = "full"
+        self._scale_mode:        str = "fit"
+        self._crop_mode:         str = "full"
+        self._output_scale_mode: str = "fit"
+        self._output_crop_mode:  str = "full"
         self._bg_color:   QColor = QColor("#1f1f1f")
 
         self._output_enabled: bool  = False
@@ -311,6 +315,14 @@ class VideoDisplay(QLabel):
 
     def set_crop_mode(self, mode: str):
         self._crop_mode = mode
+        self._refresh()
+
+    def set_output_scale_mode(self, mode: str):
+        self._output_scale_mode = mode
+        self._refresh()
+
+    def set_output_crop_mode(self, mode: str):
+        self._output_crop_mode = mode
         self._refresh()
 
     def set_bg_color(self, color: QColor):
@@ -342,11 +354,12 @@ class VideoDisplay(QLabel):
     def get_pan_zoom(self) -> tuple[float, float, float]:
         return self._pan_x, self._pan_y, self._zoom
 
-    def _cropped(self, px: QPixmap) -> QPixmap:
-        if self._crop_mode == "full":
+    def _cropped(self, px: QPixmap, mode: str | None = None) -> QPixmap:
+        mode = mode if mode is not None else self._crop_mode
+        if mode == "full":
             return px
         try:
-            rw, rh = (int(p) for p in self._crop_mode.split(":"))
+            rw, rh = (int(p) for p in mode.split(":"))
         except ValueError:
             return px
         sw, sh = px.width(), px.height()
@@ -432,23 +445,44 @@ class VideoDisplay(QLabel):
             self._render_px = None
             return
 
-        px = self._cropped(self._pixmap)
+        px = self._cropped(self._pixmap, self._output_crop_mode)
         src_w, src_h = px.width(), px.height()
         if src_w == 0 or src_h == 0:
             self._render_px = None
             return
 
-        draw_scale = min(canvas_w / src_w, canvas_h / src_h) * self._zoom
-        dw = max(1, int(src_w * draw_scale))
-        dh = max(1, int(src_h * draw_scale))
+        fast   = Qt.TransformationMode.FastTransformation
+        ignore = Qt.AspectRatioMode.IgnoreAspectRatio
+        mode   = self._output_scale_mode
+        cw, ch = canvas_w, canvas_h
 
-        cx = canvas_x + canvas_w // 2
-        cy = canvas_y + canvas_h // 2
+        if mode == "stretch":
+            dw = max(1, int(cw * self._zoom))
+            dh = max(1, int(ch * self._zoom))
+        elif mode == "fill":
+            s = max(cw / src_w, ch / src_h) * self._zoom
+            dw, dh = max(1, int(src_w * s)), max(1, int(src_h * s))
+        elif mode == "native":
+            dw, dh = max(1, int(src_w * self._zoom)), max(1, int(src_h * self._zoom))
+        elif mode.startswith("area_"):
+            rw, rh = (int(v) for v in mode[5:].split("_"))
+            as_ = min(cw / rw, ch / rh)
+            s   = min(rw * as_ / src_w, rh * as_ / src_h) * self._zoom
+            dw, dh = max(1, int(src_w * s)), max(1, int(src_h * s))
+        elif mode.startswith("stretch_"):
+            rw, rh = (int(v) for v in mode[8:].split("_"))
+            as_ = min(cw / rw, ch / rh)
+            dw, dh = max(1, int(rw * as_ * self._zoom)), max(1, int(rh * as_ * self._zoom))
+        else:  # "fit"
+            s = min(cw / src_w, ch / src_h) * self._zoom
+            dw, dh = max(1, int(src_w * s)), max(1, int(src_h * s))
+
+        cx = canvas_x + cw // 2
+        cy = canvas_y + ch // 2
         dx = cx - dw // 2 + int(self._pan_x * disp_scale)
         dy = cy - dh // 2 + int(self._pan_y * disp_scale)
 
-        fast = Qt.TransformationMode.FastTransformation
-        self._render_px = px.scaled(dw, dh, Qt.AspectRatioMode.IgnoreAspectRatio, fast)
+        self._render_px = px.scaled(dw, dh, ignore, fast)
         self._render_pt = QPoint(dx, dy)
 
     def resizeEvent(self, event):
@@ -1060,6 +1094,40 @@ class MainWindow(QMainWindow):
         fpgl.addWidget(self._out_fps_combo)
         layout.addWidget(fps_grp)
 
+        disp_grp = QGroupBox("Scale && Crop")
+        dgl = QVBoxLayout(disp_grp)
+        dgl.addWidget(QLabel("Scale Mode:"))
+        self._out_scale_combo = QComboBox()
+        for label, key in [
+            ("Fit (Keep Aspect)",       "fit"),
+            ("Stretch to Fill",         "stretch"),
+            ("Zoom to Fill (Crop)",     "fill"),
+            ("Native (1:1 Pixels)",     "native"),
+            ("Fit to 16:9 Area",        "area_16_9"),
+            ("Fit to 10:9 Area",        "area_10_9"),
+            ("Fit to 5:4 Area",         "area_5_4"),
+            ("Fit to 4:3 Area",         "area_4_3"),
+            ("Stretch to 16:9 Area",    "stretch_16_9"),
+            ("Stretch to 10:9 Area",    "stretch_10_9"),
+            ("Stretch to 5:4 Area",     "stretch_5_4"),
+            ("Stretch to 4:3 Area",     "stretch_4_3"),
+        ]:
+            self._out_scale_combo.addItem(label, key)
+        self._out_scale_combo.currentIndexChanged.connect(self._on_out_scale_mode_changed)
+        dgl.addWidget(self._out_scale_combo)
+        dgl.addWidget(QLabel("Crop:"))
+        self._out_crop_combo = QComboBox()
+        for label, key in [
+            ("Full Image",    "full"),
+            ("Crop to 10:9",  "10:9"),
+            ("Crop to 5:4",   "5:4"),
+            ("Crop to 4:3",   "4:3"),
+        ]:
+            self._out_crop_combo.addItem(label, key)
+        self._out_crop_combo.currentIndexChanged.connect(self._on_out_crop_mode_changed)
+        dgl.addWidget(self._out_crop_combo)
+        layout.addWidget(disp_grp)
+
         pz_grp = QGroupBox("Pan / Zoom")
         pzl = QVBoxLayout(pz_grp)
         hint = QLabel("Drag the preview to pan · scroll to zoom")
@@ -1197,9 +1265,11 @@ class MainWindow(QMainWindow):
             volume_db     = self._vol_slider.value(),
             volume_l_db   = self._vol_l_slider.value(),
             volume_r_db   = self._vol_r_slider.value(),
-            pan_x         = self._display._pan_x,
-            pan_y         = self._display._pan_y,
-            zoom          = self._display._zoom,
+            output_scale_mode = self._out_scale_combo.currentData() or "fit",
+            output_crop_mode  = self._out_crop_combo.currentData() or "full",
+            pan_x             = self._display._pan_x,
+            pan_y             = self._display._pan_y,
+            zoom              = self._display._zoom,
         )
 
     def _load_from_disk(self, name: str) -> AppSettings:
@@ -1263,9 +1333,11 @@ class MainWindow(QMainWindow):
             volume_db     = aud("volume_db",   0,     int),
             volume_l_db   = aud("volume_l_db", 0,     int),
             volume_r_db   = aud("volume_r_db", 0,     int),
-            pan_x         = float(_s("output/pan_x", 0.0) or 0.0),
-            pan_y         = float(_s("output/pan_y", 0.0) or 0.0),
-            zoom          = float(_s("output/zoom",  1.0) or 1.0),
+            output_scale_mode = _s("output/scale_mode", "fit"),
+            output_crop_mode  = _s("output/crop_mode",  "full"),
+            pan_x             = float(_s("output/pan_x", 0.0) or 0.0),
+            pan_y             = float(_s("output/pan_y", 0.0) or 0.0),
+            zoom              = float(_s("output/zoom",  1.0) or 1.0),
         )
 
     def _save_to_disk(self, settings: AppSettings, name: str):
@@ -1288,6 +1360,8 @@ class MainWindow(QMainWindow):
         s.setValue("audio/volume_db",      settings.volume_db)
         s.setValue("audio/volume_l_db",    settings.volume_l_db)
         s.setValue("audio/volume_r_db",    settings.volume_r_db)
+        s.setValue("output/scale_mode",    settings.output_scale_mode)
+        s.setValue("output/crop_mode",     settings.output_crop_mode)
         s.setValue("output/pan_x",         settings.pan_x)
         s.setValue("output/pan_y",         settings.pan_y)
         s.setValue("output/zoom",          settings.zoom)
@@ -1365,7 +1439,11 @@ class MainWindow(QMainWindow):
         self._vol_r_lbl.setText(_db_label(settings.volume_r_db))
         self._update_vol_slider_states()
 
-        # Pan / zoom
+        # Output scale / crop / pan / zoom
+        self._select_combo(self._out_scale_combo, settings.output_scale_mode)
+        self._display.set_output_scale_mode(settings.output_scale_mode)
+        self._select_combo(self._out_crop_combo, settings.output_crop_mode)
+        self._display.set_output_crop_mode(settings.output_crop_mode)
         self._display.set_pan_zoom(settings.pan_x, settings.pan_y, settings.zoom)
         self._out_pan_x_lbl.setText(f"{settings.pan_x:.1f}")
         self._out_pan_y_lbl.setText(f"{settings.pan_y:.1f}")
@@ -1797,6 +1875,14 @@ class MainWindow(QMainWindow):
     def _on_out_res_changed(self):
         self._on_out_settings_changed()
 
+    def _on_out_scale_mode_changed(self):
+        self._display.set_output_scale_mode(self._out_scale_combo.currentData())
+        self._mark_dirty()
+
+    def _on_out_crop_mode_changed(self):
+        self._display.set_output_crop_mode(self._out_crop_combo.currentData())
+        self._mark_dirty()
+
     def _on_out_settings_changed(self):
         if self._out_enabled.isChecked():
             self._restart_output()
@@ -1908,7 +1994,12 @@ class MainWindow(QMainWindow):
     def _feed_output(self, img: QImage):
         if self._output_worker is not None:
             pan_x, pan_y, zoom = self._display.get_pan_zoom()
-            self._output_worker.push_frame(img, pan_x, pan_y, zoom, self._display._bg_color)
+            self._output_worker.push_frame(
+                img, pan_x, pan_y, zoom,
+                self._display._bg_color,
+                self._display._output_scale_mode,
+                self._display._output_crop_mode,
+            )
 
     # ── output global settings I/O ────────────────────────────────────────────
 
