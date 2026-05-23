@@ -13,6 +13,12 @@ a = Analysis(
     binaries=qt_binaries,
     datas=qt_datas,
     hiddenimports=qt_hidden + [
+        "ui",
+        "video",
+        "audio",
+        "output",
+        "settings",
+        "utils",
         "workers",
         "vu_meter",
         "numpy",

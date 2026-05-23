@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Release version — omit the "v" prefix (e.g. 1.2.0). Check the previous tag shown in the first step if unsure.'
+        description: 'Release version — omit the "v" prefix (e.g. 1.2.0). Check the previous tag shown in the first step if unsure. Version numbering should be "{major}.{minor}.{patch}" and follow semver principles. This will be used as the release tag and in the archive name, so choose carefully and sequentially!'
         required: true
-        default: '1.0'
+        default: '1.1.1'
 
 permissions:
   contents: write

@@ -111,7 +111,13 @@ V4L2-compatible capture device.
 
 ```
 hagibis-monitor/
-├── main.py       # Entry point, MainWindow, VideoDisplay, AppSettings, profiles
+├── main.py       # Entry point — constructs QApplication + MainWindow
+├── ui.py         # MainWindow + _StatusBar — all UI construction, profile mgmt, stream orchestration
+├── video.py      # VideoDisplay widget + video device scanning / capability querying
+├── audio.py      # Audio device scanning (PulseAudio sources → ALSA fallback)
+├── output.py     # v4l2loopback discovery / load / unload + _ModprobeWorker
+├── settings.py   # AppSettings + OutputSettings dataclasses + resolution/format/fps constant tables
+├── utils.py      # Small shared helpers (_dev_key, _aspect_label, _sbin, _slider_row, _db_label)
 ├── workers.py    # VideoWorker, AudioWorker, OutputWorker (QThread subclasses)
 ├── vu_meter.py   # VuMeter, DbScale, StereoVuMeter custom widgets
 ├── .gitignore
@@ -131,28 +137,94 @@ Settings are stored in:
 
 ### main.py
 
-Key components:
+Minimal entry point. Creates `QApplication`, sets the `"Fusion"` style,
+instantiates `MainWindow` from `ui.py`, shows it, and enters the event loop.
+No application logic lives here.
 
-**`AppSettings` (dataclass)** — flat struct holding every profile-able value:
-panel visibility, scale/crop/bg_color, video device, fmt/res/fps/image
-controls, audio device, audio enabled, mono mix, passthrough, three volume
-levels, output scale/crop modes, and pan/zoom.
+### ui.py
 
-**`OutputSettings` (dataclass)** — globally-stored output settings: enabled
-flag, loopback device path, width, height, pixel format, fps. Always starts
-disabled on launch regardless of saved state.
+**`MainWindow(QMainWindow)`** — owns every widget and every worker. Builds
+the three tabs (Video / Audio / Output), the profile bar, the dark theme,
+and the status bar. Holds references to the running `VideoWorker`,
+`AudioWorker`, `OutputWorker`, and `_ModprobeWorker`. Manages the dirty
+flag and the unsaved-changes dialog.
 
-**`VideoDisplay(QLabel)`** — renders frames via `paintEvent` using a
-pre-computed `(QPixmap, QPoint)` pair. Supports all twelve scale modes and
-four crop modes independently for both display and loopback output.
-
-**`MainWindow`** — builds the UI, owns the workers, manages profiles.
 Key I/O methods:
 - `_collect_settings() → AppSettings` — reads every widget into a struct.
 - `_apply_settings(s)` — applies a struct to every widget + restarts streams.
 - `_load_from_disk(name) → AppSettings` — reads a profile INI file.
 - `_save_to_disk(s, name)` — writes a profile INI file atomically via one
   QSettings object (avoids the multi-object sync bug).
+
+**`_StatusBar(QWidget)`** — custom full-width status bar that centres the
+`● Audio` / `● Video` output indicators over the video display area, with
+the FPS readout pinned to the right.
+
+### video.py
+
+**`VideoDisplay(QLabel)`** — renders frames via `paintEvent` using a
+pre-computed `(QPixmap, QPoint)` pair. Supports all twelve scale modes and
+four crop modes independently for both display and loopback output. Owns
+the pan/zoom state and emits `output_changed(pan_x, pan_y, zoom)` when the
+user drags or wheel-scrolls inside the canvas.
+
+**`_scan_video_devices()`** — runs `v4l2-ctl --list-devices`; falls back
+to globbing `/dev/video*` if v4l2-ctl is missing.
+
+**`_query_device_caps(dev)`** — runs `v4l2-ctl --list-formats-ext` for one
+device and returns a `{format: {label, sizes: {(w, h): [fps, …]}}}` dict.
+
+### audio.py
+
+**`_scan_audio_devices()`** — prefers `pactl list sources` (works under
+PipeWire); falls back to `arecord -l` for direct ALSA addressing. Returns
+`[(display_label, ffmpeg_address), …]`.
+
+### output.py
+
+**`_find_loopback_devices()`** — walks `/sys/class/video4linux/` looking
+for nodes that expose the `max_openers` attribute (or have `v4l2loopback`
+in their device path / name). Returns `/dev/videoN` paths.
+
+**`_v4l2loopback_installed()`** — checks for the `.ko` file under the
+running kernel or `/sys/module/v4l2loopback`.
+
+**`_load_v4l2loopback()` / `_unload_v4l2loopback()`** — modprobes the
+module, falling back to `pkexec` if direct invocation fails. Loads
+without `exclusive_caps` so OBS sees the full set of resolutions.
+
+**`_ModprobeWorker(QThread)`** — runs `_load_v4l2loopback()` off the UI
+thread; emits `done(device_path, loaded_by_us)`.
+
+### settings.py
+
+**`AppSettings` (dataclass)** — flat struct holding every profile-able value:
+scale/crop/bg_color, video device, fmt/res/fps/image controls, audio device,
+audio enabled, mono mix, passthrough, three volume levels, output scale/crop
+modes, and pan/zoom.
+
+**`OutputSettings` (dataclass)** — globally-stored output settings: enabled
+flag, loopback device path, width, height, pixel format, fps. Always starts
+disabled on launch regardless of saved state.
+
+Also holds the constant tables used by the UI: `_DEFAULT_RESOLUTIONS`,
+`_DEFAULT_FRAMERATES`, `_DEFAULT_FORMATS`, `_OUTPUT_RESOLUTIONS`,
+`_OUTPUT_PIXEL_FORMATS`, `_OUTPUT_FPS`.
+
+### utils.py
+
+Tiny shared helpers used by `ui.py` and `output.py`:
+- `_dev_key(path)` — sanitises a device path for use as an INI key (legacy
+  migration support).
+- `_aspect_label(w, h)` — `gcd`-reduced aspect ratio label (with `16:10`
+  override for the `8:5` corner case).
+- `_sbin(cmd)` — resolves a command that may live in `/usr/sbin` even
+  when `PATH` is minimal.
+- `_slider_row(lo, hi, val, on_change)` — builds a `(QSlider, QLabel)`
+  pair with a value readout, returned as an `(HBoxLayout, slider, label)`
+  tuple.
+- `_db_label(v)` — formats an int dB value as `"0 dB"` or `"+3 dB"` /
+  `"-12 dB"`.
 
 ### workers.py
 
@@ -571,12 +643,97 @@ If the pipeline drops frames, lower the resolution or frame rate.
 > This section gives you the full picture so you can contribute without
 > re-reading the whole conversation.
 
+### Keep this README up to date
+
+**This README is the canonical context document for the project.** Whenever
+you change something that affects how a future assistant should reason about
+the code, update the README in the same change. That includes:
+
+- File splits, renames, or new modules → update [Project layout](#project-layout)
+  and the per-file sub-sections.
+- New `AppSettings` / `OutputSettings` fields → update the [AppSettings fields](#appsettings-fields-current)
+  block and the [Profiles](#profiles) "what each profile stores" table.
+- New ffmpeg / pactl invocations or worker threads → update
+  [Architecture](#architecture) and the relevant worker description.
+- New UI tabs, controls, or status indicators → update the
+  [UI walkthrough](#ui-walkthrough) and [What the app does](#what-the-app-does).
+- New external dependencies → update the [Dependencies](#dependencies) table.
+- New design decisions or non-obvious quirks → update [Key design decisions](#key-design-decisions)
+  or [Known quirks and gotchas](#known-quirks-and-gotchas).
+
+If a change makes any part of the README stale, fix it in the same commit —
+do not leave it for "later." A stale README is worse than a missing one
+because future assistants will trust it.
+
+**Always use Mermaid for diagrams.** Any flow, dependency, state machine,
+sequence, or architecture diagram added to this README — or to any other
+markdown doc in the repo — must be a fenced ```mermaid``` block, never an
+ASCII-art box drawing, never an embedded image, and never a link to an
+external diagramming tool. Mermaid renders natively on GitHub, stays
+diffable in PRs, and can be updated in-place when the underlying code
+changes. Examples already in this file: the [Architecture](#architecture)
+runtime graph and the [Module dependency graph](#module-dependency-graph).
+
 ### What this project is
 
 A PyQt6 GUI monitor for USB capture cards on a Linux desktop. Not a recording
 tool — purely live monitoring, image control, optional audio passthrough,
 virtual camera output (v4l2loopback), and virtual microphone (PulseAudio).
 All settings are organised into named profiles.
+
+### Code organisation
+
+The codebase is split by functional area (see [Project layout](#project-layout)
+for the full file tree):
+
+| File | Role |
+|---|---|
+| `main.py` | Entry point only — `QApplication` + `MainWindow` |
+| `ui.py` | `MainWindow` (everything UI-side) + `_StatusBar` |
+| `video.py` | `VideoDisplay` widget + V4L2 device scanning / cap query |
+| `audio.py` | PulseAudio / ALSA device scanning |
+| `output.py` | v4l2loopback discovery / load / unload + `_ModprobeWorker` |
+| `settings.py` | `AppSettings` + `OutputSettings` dataclasses + constant tables |
+| `utils.py` | Small shared helpers (`_dev_key`, `_aspect_label`, `_sbin`, `_slider_row`, `_db_label`) |
+| `workers.py` | `VideoWorker`, `AudioWorker`, `OutputWorker` — all three `QThread` subprocess drivers |
+| `vu_meter.py` | `VuMeter`, `DbScale`, `StereoVuMeter` |
+
+`MainWindow` in `ui.py` is intentionally monolithic — it owns every widget
+and every worker, and orchestrates profile load/save, stream restarts,
+real-time volume application, and the dirty-state dialog. Splitting it
+further would require restructuring methods into mixins or per-tab
+controllers, which would be a behavioural change rather than reorganisation.
+
+#### Module dependency graph
+
+```mermaid
+flowchart TD
+    main[main.py<br/>entry point]
+    ui[ui.py<br/>MainWindow + _StatusBar]
+    video[video.py<br/>VideoDisplay + v4l2-ctl scan]
+    audio[audio.py<br/>pactl / arecord scan]
+    output[output.py<br/>v4l2loopback + _ModprobeWorker]
+    workers[workers.py<br/>VideoWorker / AudioWorker / OutputWorker]
+    vu[vu_meter.py<br/>VuMeter / DbScale / StereoVuMeter]
+    settings[settings.py<br/>AppSettings / OutputSettings + const tables]
+    utils[utils.py<br/>_dev_key / _aspect_label / _sbin / _slider_row / _db_label]
+
+    main --> ui
+    ui --> video
+    ui --> audio
+    ui --> output
+    ui --> workers
+    ui --> vu
+    ui --> settings
+    ui --> utils
+    output --> utils
+```
+
+Notes:
+- `workers.py`, `vu_meter.py`, `video.py`, `audio.py`, and `settings.py` have
+  no project-local imports — they only depend on PyQt6, numpy, and stdlib.
+- Only `ui.py` reaches across modules to wire things together; nothing
+  outside `ui.py` depends on `MainWindow`.
 
 ### Architecture
 
