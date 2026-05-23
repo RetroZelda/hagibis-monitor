@@ -10,7 +10,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QLabel, QSlider, QComboBox, QCheckBox, QPushButton, QGroupBox,
     QTabWidget, QTabBar, QScrollArea, QSizePolicy, QFrame,
-    QColorDialog, QInputDialog, QMessageBox,
+    QColorDialog, QInputDialog, QMessageBox, QLineEdit,
 )
 from PyQt6.QtCore import Qt, QPoint, QRect, QSettings, QTimer
 from PyQt6.QtGui import QImage, QPixmap, QPainter, QColor, QFont, QPalette
@@ -57,6 +57,8 @@ class AppSettings:
     volume_db:     int   = 0
     volume_l_db:   int   = 0
     volume_r_db:   int   = 0
+    # Output
+    output_enabled: bool = False
 
 
 # ── module-level helpers ──────────────────────────────────────────────────────
@@ -405,6 +407,7 @@ class MainWindow(QMainWindow):
         tabs = QTabWidget()
         tabs.addTab(self._build_video_tab(), "Video")
         tabs.addTab(self._build_audio_tab(), "Audio")
+        tabs.addTab(self._build_output_tab(), "Output")
         panel_layout.addWidget(tabs)
         panel_layout.addStretch()
 
@@ -622,6 +625,58 @@ class MainWindow(QMainWindow):
         layout.addStretch()
         return w
 
+    def _build_output_tab(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(4, 6, 4, 4)
+        layout.setSpacing(6)
+
+        self._output_enabled = QCheckBox("Enable Virtual Microphone Output")
+        self._output_enabled.setToolTip(
+            "Creates a virtual microphone in PulseAudio/PipeWire.\n"
+            "Audio from the selected input device is routed through it\n"
+            "with all volume and mono settings from the Audio tab applied."
+        )
+        self._output_enabled.stateChanged.connect(self._on_output_toggle)
+        layout.addWidget(self._output_enabled)
+
+        obs_grp = QGroupBox("OBS Setup")
+        ol = QVBoxLayout(obs_grp)
+        ol.addWidget(QLabel(
+            "In OBS, add an Audio Input Capture source\n"
+            "and select the device named below:"
+        ))
+
+        device_row = QHBoxLayout()
+        self._output_device_edit = QLineEdit(AudioWorker.SOURCE_NAME)
+        self._output_device_edit.setReadOnly(True)
+        device_row.addWidget(self._output_device_edit, 1)
+        copy_btn = QPushButton("Copy")
+        copy_btn.setFixedWidth(52)
+        copy_btn.setToolTip("Copy device name to clipboard")
+        copy_btn.clicked.connect(
+            lambda: QApplication.clipboard().setText(self._output_device_edit.text())
+        )
+        device_row.addWidget(copy_btn)
+        ol.addLayout(device_row)
+
+        note = QLabel(
+            "In OBS select Sources → Audio Input Capture\n"
+            "and look for \"Hagibis Virtual Microphone\".\n\n"
+            "Master volume, channel volumes, and mono mix\n"
+            "from the Audio tab are all applied."
+        )
+        note.setStyleSheet("color: #888888; font-size: 11px;")
+        ol.addWidget(note)
+        layout.addWidget(obs_grp)
+
+        self._output_status_lbl = QLabel("○ Inactive")
+        self._output_status_lbl.setStyleSheet("color: #888888;")
+        layout.addWidget(self._output_status_lbl)
+
+        layout.addStretch()
+        return w
+
     # ── theming ───────────────────────────────────────────────────────────────
     def _apply_dark_theme(self):
         app = QApplication.instance()
@@ -732,6 +787,7 @@ class MainWindow(QMainWindow):
             volume_db     = self._vol_slider.value(),
             volume_l_db   = self._vol_l_slider.value(),
             volume_r_db   = self._vol_r_slider.value(),
+            output_enabled = self._output_enabled.isChecked(),
         )
 
     def _load_from_disk(self, name: str) -> AppSettings:
@@ -795,6 +851,7 @@ class MainWindow(QMainWindow):
             volume_db     = aud("volume_db",   0,     int),
             volume_l_db   = aud("volume_l_db", 0,     int),
             volume_r_db   = aud("volume_r_db", 0,     int),
+            output_enabled = aud("output_enabled", False, bool),
         )
 
     def _save_to_disk(self, settings: AppSettings, name: str):
@@ -817,6 +874,7 @@ class MainWindow(QMainWindow):
         s.setValue("audio/volume_db",      settings.volume_db)
         s.setValue("audio/volume_l_db",    settings.volume_l_db)
         s.setValue("audio/volume_r_db",    settings.volume_r_db)
+        s.setValue("audio/output_enabled", settings.output_enabled)
         s.sync()
 
     def _apply_settings(self, settings: AppSettings):
@@ -869,9 +927,10 @@ class MainWindow(QMainWindow):
 
         # Audio options (block signals to avoid premature restarts)
         for widget, val in [
-            (self._audio_enabled, settings.audio_enabled),
-            (self._mono_mix,      settings.mono_mix),
-            (self._passthrough,   settings.passthrough),
+            (self._audio_enabled,  settings.audio_enabled),
+            (self._mono_mix,       settings.mono_mix),
+            (self._passthrough,    settings.passthrough),
+            (self._output_enabled, settings.output_enabled),
         ]:
             widget.blockSignals(True)
             widget.setChecked(val)
@@ -1239,12 +1298,13 @@ class MainWindow(QMainWindow):
     def _start_audio(self):
         self._stop_audio()
         wk = AudioWorker()
-        wk.device      = self._audio_device_combo.currentData() or "plughw:Hagibis,0"
-        wk.mono_mix    = self._mono_mix.isChecked()
-        wk.passthrough = self._passthrough.isChecked()
-        wk.volume_db   = self._vol_slider.value()
-        wk.volume_l_db = self._vol_l_slider.value()
-        wk.volume_r_db = self._vol_r_slider.value()
+        wk.device          = self._audio_device_combo.currentData() or "plughw:Hagibis,0"
+        wk.mono_mix        = self._mono_mix.isChecked()
+        wk.passthrough     = self._passthrough.isChecked()
+        wk.virtual_output  = self._output_enabled.isChecked()
+        wk.volume_db       = self._vol_slider.value()
+        wk.volume_l_db     = self._vol_l_slider.value()
+        wk.volume_r_db     = self._vol_r_slider.value()
         wk.levels_updated.connect(self._vu.set_levels)
         wk.error.connect(lambda e: self._lbl_signal.setText(f"Audio error: {e}"))
         self._audio_worker = wk
@@ -1252,6 +1312,7 @@ class MainWindow(QMainWindow):
         self._pa_sink_input = None
         self._pa_poll_count = 0
         QTimer.singleShot(80, self._poll_pa_sink_input)
+        self._update_output_status()
 
     def _stop_audio(self):
         self._pa_sink_input = None
@@ -1260,6 +1321,7 @@ class MainWindow(QMainWindow):
             self._audio_worker.wait(3000)
             self._audio_worker = None
         self._vu.set_levels(-96.0, -96.0)
+        self._update_output_status()
 
     def _on_audio_toggle(self, state: int):
         if state == Qt.CheckState.Checked.value:
@@ -1267,12 +1329,29 @@ class MainWindow(QMainWindow):
         else:
             self._stop_audio()
         self._update_vol_slider_states()
+        self._update_output_status()
         self._mark_dirty()
 
     def _on_audio_opt_change(self):
         if self._audio_enabled.isChecked():
             self._start_audio()
         self._mark_dirty()
+
+    # ── virtual output ────────────────────────────────────────────────────────
+    def _on_output_toggle(self, state: int):
+        if self._audio_enabled.isChecked():
+            self._start_audio()  # restart worker with new virtual_output value
+        self._update_output_status()
+        self._mark_dirty()
+
+    def _update_output_status(self):
+        active = self._audio_enabled.isChecked() and self._output_enabled.isChecked()
+        if active:
+            self._output_status_lbl.setText("● Active")
+            self._output_status_lbl.setStyleSheet("color: #50c878;")
+        else:
+            self._output_status_lbl.setText("○ Inactive")
+            self._output_status_lbl.setStyleSheet("color: #888888;")
 
     def _update_vol_slider_states(self):
         on = self._audio_enabled.isChecked()
