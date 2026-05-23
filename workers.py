@@ -288,6 +288,37 @@ class AudioWorker(QThread):
 
     # ── virtual mic lifecycle ─────────────────────────────────────────────────
 
+    def _find_existing_modules(self) -> bool:
+        """Populate _bus_mod/_src_mod from already-loaded modules; return True if both found."""
+        try:
+            out = subprocess.check_output(
+                ["pactl", "list", "short", "modules"],
+                stderr=subprocess.DEVNULL, timeout=3,
+            ).decode(errors="replace")
+            bus_mod = None
+            src_mod = None
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                if parts[1] == "module-null-sink" and self.BUS_SINK in line:
+                    try:
+                        bus_mod = int(parts[0])
+                    except ValueError:
+                        pass
+                elif parts[1] in ("module-virtual-source", "module-remap-source") and self.SOURCE_NAME in line:
+                    try:
+                        src_mod = int(parts[0])
+                    except ValueError:
+                        pass
+            if bus_mod is not None and src_mod is not None:
+                self._bus_mod = bus_mod
+                self._src_mod = src_mod
+                return True
+        except Exception:
+            pass
+        return False
+
     def _cleanup_stale_source(self):
         try:
             out = subprocess.check_output(
@@ -313,6 +344,8 @@ class AudioWorker(QThread):
             pass
 
     def _create_virtual_source(self) -> bool:
+        if self._find_existing_modules():
+            return True
         self._cleanup_stale_source()
         try:
             out = subprocess.check_output(
@@ -492,6 +525,17 @@ class AudioWorker(QThread):
                 msg = stderr.splitlines()[-1] if stderr else f"ffmpeg exited ({self._proc.returncode})"
                 self.error.emit(msg)
 
+        # Stop pacat but leave the PA modules loaded so OBS keeps the device.
+        if self._pacat_proc is not None:
+            self._pacat_proc.terminate()
+            try:
+                self._pacat_proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self._pacat_proc.kill()
+            self._pacat_proc = None
+
+    def teardown(self):
+        """Unload the virtual PulseAudio source. Call only when virtual output is being disabled."""
         self._remove_virtual_source()
 
     def stop(self):

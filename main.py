@@ -223,7 +223,7 @@ def _load_v4l2loopback() -> tuple[str, bool]:
         cmd = prefix + [
             modprobe, "v4l2loopback",
             "devices=1", "video_nr=10",
-            "card_label=HagibisMonitor", "exclusive_caps=1",
+            "card_label=HagibisMonitor",
         ]
         try:
             r = subprocess.run(cmd, capture_output=True, timeout=15)
@@ -1818,11 +1818,13 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(80, self._poll_pa_sink_input)
         self._update_output_status()
 
-    def _stop_audio(self):
+    def _stop_audio(self, teardown_virtual: bool = False):
         self._pa_sink_input = None
         if self._audio_worker:
             self._audio_worker.stop()
             self._audio_worker.wait(3000)
+            if teardown_virtual:
+                self._audio_worker.teardown()
             self._audio_worker = None
         self._vu.set_levels(-96.0, -96.0)
         self._update_output_status()
@@ -1904,6 +1906,7 @@ class MainWindow(QMainWindow):
             self._v4l2_device = ""
             w, h = self._out_res_combo.currentData() or (1920, 1080)
             self._display.set_output_mode(False, w, h)
+            self._stop_audio(teardown_virtual=True)
             if self._audio_enabled.isChecked():
                 self._start_audio()
             self._update_output_status()
@@ -1989,7 +1992,8 @@ class MainWindow(QMainWindow):
         if self._out_enabled.isChecked():
             w, h = self._out_res_combo.currentData() or (1920, 1080)
             self._display.set_output_mode(True, w, h)
-            self._start_output()
+            self._stop_output()  # close device now → triggers SOURCE_CHANGE to readers
+            QTimer.singleShot(150, self._start_output)  # reopen after readers react
 
     def _feed_output(self, img: QImage):
         if self._output_worker is not None:
@@ -2147,7 +2151,7 @@ class MainWindow(QMainWindow):
         self._save_global()
         self._save_to_disk(self._collect_settings(), self._current_profile)
         self._stop_output()
-        self._stop_audio()
+        self._stop_audio(teardown_virtual=True)
         self._stop_video()
         event.accept()
 
