@@ -1,9 +1,10 @@
 import os
+import queue
 import subprocess
 import time
 import numpy as np
-from PyQt6.QtCore import QThread, pyqtSignal
-from PyQt6.QtGui import QImage
+from PyQt6.QtCore import QThread, Qt, pyqtSignal
+from PyQt6.QtGui import QColor, QImage, QPainter
 
 
 class VideoWorker(QThread):
@@ -87,6 +88,125 @@ class VideoWorker(QThread):
         self._running = False
         if self._proc:
             self._proc.terminate()
+
+
+class OutputWorker(QThread):
+    """Renders input frames into a fixed-resolution canvas and pipes to a v4l2loopback device."""
+
+    error = pyqtSignal(str)
+
+    def __init__(self, device: str, width: int, height: int, fps: int, pixel_format: str):
+        super().__init__()
+        self._device = device
+        self._width = width
+        self._height = height
+        self._fps = fps
+        self._pixel_format = pixel_format
+        self._q: queue.Queue = queue.Queue(maxsize=4)
+        self._running = False
+
+    def push_frame(self, img: QImage, pan_x: float, pan_y: float, zoom: float, bg: QColor):
+        item = (img, pan_x, pan_y, zoom, bg)
+        if self._q.full():
+            try:
+                self._q.get_nowait()
+            except queue.Empty:
+                pass
+        try:
+            self._q.put_nowait(item)
+        except queue.Full:
+            pass
+
+    def stop(self):
+        self._running = False
+
+    def run(self):
+        self._running = True
+        interval = 1.0 / self._fps
+        cmd = [
+            "ffmpeg", "-y", "-loglevel", "quiet",
+            "-f", "rawvideo", "-pix_fmt", "rgb24",
+            "-s", f"{self._width}x{self._height}",
+            "-r", str(self._fps),
+            "-i", "pipe:0",
+            "-f", "v4l2",
+            "-pix_fmt", self._pixel_format,
+            self._device,
+        ]
+        try:
+            proc = subprocess.Popen(
+                cmd, stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except OSError as e:
+            self.error.emit(str(e))
+            return
+
+        last_item = None
+        next_pts = time.monotonic()
+
+        while self._running and proc.poll() is None:
+            # Drain queue, keeping only the most recent frame
+            try:
+                while True:
+                    last_item = self._q.get_nowait()
+            except queue.Empty:
+                pass
+
+            if last_item is None:
+                # No frame yet — wait for the first one
+                try:
+                    last_item = self._q.get(timeout=0.1)
+                    next_pts = time.monotonic()
+                except queue.Empty:
+                    continue
+
+            # Sleep until the next frame is due
+            sleep_for = next_pts - time.monotonic()
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+
+            src, pan_x, pan_y, zoom, bg = last_item
+            data = self._render(src, pan_x, pan_y, zoom, bg)
+            try:
+                proc.stdin.write(data)
+            except (BrokenPipeError, OSError):
+                break
+
+            next_pts += interval
+            # Prevent spiral if rendering falls behind
+            if time.monotonic() > next_pts + interval:
+                next_pts = time.monotonic()
+
+        self._running = False
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+    def _render(self, src: QImage, pan_x: float, pan_y: float, zoom: float, bg: QColor) -> bytes:
+        out = QImage(self._width, self._height, QImage.Format.Format_RGB888)
+        out.fill(bg)
+        src_w, src_h = src.width(), src.height()
+        if src_w > 0 and src_h > 0:
+            fit = min(self._width / src_w, self._height / src_h)
+            dw = max(1, int(src_w * fit * zoom))
+            dh = max(1, int(src_h * fit * zoom))
+            dx = int((self._width - dw) / 2 + pan_x)
+            dy = int((self._height - dh) / 2 + pan_y)
+            scaled = src.scaled(dw, dh,
+                                Qt.AspectRatioMode.IgnoreAspectRatio,
+                                Qt.TransformationMode.SmoothTransformation)
+            p = QPainter(out)
+            p.drawImage(dx, dy, scaled)
+            p.end()
+        ptr = out.bits()
+        ptr.setsize(out.sizeInBytes())
+        return bytes(ptr)
 
 
 class AudioWorker(QThread):

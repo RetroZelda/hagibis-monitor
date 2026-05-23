@@ -1,7 +1,11 @@
 import glob
+import os
+import platform
 import re
+import shutil
 import sys
 import subprocess
+import time
 from dataclasses import dataclass
 from math import gcd
 from pathlib import Path
@@ -10,12 +14,12 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QLabel, QSlider, QComboBox, QCheckBox, QPushButton, QGroupBox,
     QTabWidget, QTabBar, QScrollArea, QSizePolicy, QFrame,
-    QColorDialog, QInputDialog, QMessageBox, QLineEdit,
+    QColorDialog, QInputDialog, QMessageBox, QLineEdit
 )
-from PyQt6.QtCore import Qt, QPoint, QRect, QSettings, QTimer
-from PyQt6.QtGui import QImage, QPixmap, QPainter, QColor, QFont, QPalette
+from PyQt6.QtCore import Qt, QPoint, QRect, QSettings, QTimer, pyqtSignal, QThread
+from PyQt6.QtGui import QImage, QPixmap, QPainter, QColor, QFont, QPalette, QPen
 
-from workers import VideoWorker, AudioWorker
+from workers import VideoWorker, AudioWorker, OutputWorker
 from vu_meter import StereoVuMeter
 
 # ── fallback tables used when v4l2-ctl is unavailable ────────────────────────
@@ -33,8 +37,43 @@ _DEFAULT_RESOLUTIONS = [
 _DEFAULT_FRAMERATES = [60, 50, 30, 20, 10]
 _DEFAULT_FORMATS    = [("MJPEG", "mjpeg"), ("YUYV", "yuyv422")]
 
+_OUTPUT_RESOLUTIONS: dict[str, list[tuple[str, int, int]]] = {
+    "16:9":  [("3840×2160", 3840, 2160), ("2560×1440", 2560, 1440),
+              ("1920×1080", 1920, 1080), ("1280×720",  1280,  720),
+              ("854×480",    854,  480),  ("640×360",    640,  360)],
+    "4:3":   [("1600×1200", 1600, 1200), ("1024×768",  1024,  768),
+              ("800×600",    800,  600),  ("640×480",    640,  480)],
+    "5:4":   [("1280×1024", 1280, 1024), ("960×768",    960,  768)],
+    "10:9":  [("1280×1152", 1280, 1152), ("640×576",    640,  576)],
+    "21:9":  [("2560×1080", 2560, 1080), ("1720×720",  1720,  720)],
+    "1:1":   [("1080×1080", 1080, 1080), ("720×720",    720,  720)],
+}
 
-# ── settings dataclass ────────────────────────────────────────────────────────
+_OUTPUT_PIXEL_FORMATS = [
+    ("YUYV (YUY2) — most compatible", "yuyv422"),
+    ("NV12 — hardware-friendly",      "nv12"),
+    ("RGB24 — raw / lossless",        "rgb24"),
+    ("MJPEG — compressed",            "mjpeg"),
+]
+
+_OUTPUT_FPS = [60, 30, 25, 24, 15]
+
+
+# ── settings dataclasses ──────────────────────────────────────────────────────
+@dataclass
+class OutputSettings:
+    """Persisted globally (not per-profile) in HagibisMonitor.ini."""
+    enabled:      bool  = False
+    device:       str   = ""
+    width:        int   = 1920
+    height:       int   = 1080
+    pixel_format: str   = "yuyv422"
+    fps:          int   = 30
+    pan_x:        float = 0.0
+    pan_y:        float = 0.0
+    zoom:         float = 1.0
+
+
 @dataclass
 class AppSettings:
     scale_mode:    str   = "fit"
@@ -57,8 +96,6 @@ class AppSettings:
     volume_db:     int   = 0
     volume_l_db:   int   = 0
     volume_r_db:   int   = 0
-    # Output
-    output_enabled: bool = False
 
 
 # ── module-level helpers ──────────────────────────────────────────────────────
@@ -130,6 +167,83 @@ def _scan_audio_devices() -> list[tuple[str, str]]:
         return [("plughw:Hagibis,0", "plughw:Hagibis,0")]
 
 
+def _sbin(cmd: str) -> str:
+    """Resolve a command that may live in /usr/sbin even when PATH is minimal."""
+    found = shutil.which(cmd)
+    if found:
+        return found
+    for prefix in ("/usr/sbin", "/sbin"):
+        full = f"{prefix}/{cmd}"
+        if Path(full).exists():
+            return full
+    return cmd
+
+
+def _find_loopback_devices() -> list[str]:
+    """Return /dev/videoN paths that belong to a v4l2loopback device."""
+    devs = []
+    for sys_path in sorted(glob.glob("/sys/class/video4linux/video*")):
+        try:
+            real = Path(sys_path).resolve()
+            # v4l2loopback exposes a max_openers attribute; real cameras never do
+            if (real / "max_openers").exists():
+                devs.append(f"/dev/{Path(sys_path).name}")
+                continue
+            # Fallback: platform path or device name contains a recognisable keyword
+            if "v4l2loopback" in str(real):
+                devs.append(f"/dev/{Path(sys_path).name}")
+                continue
+            name = (real / "name").read_text().strip().lower()
+            if "dummy" in name or "loopback" in name:
+                devs.append(f"/dev/{Path(sys_path).name}")
+        except OSError:
+            pass
+    return devs
+
+
+def _v4l2loopback_installed() -> bool:
+    # Check for the .ko file under the running kernel — no subprocess needed.
+    kernel = platform.uname().release
+    if glob.glob(f"/lib/modules/{kernel}/**/v4l2loopback.ko*", recursive=True):
+        return True
+    # Also true if the module is already loaded.
+    return Path("/sys/module/v4l2loopback").exists()
+
+
+def _load_v4l2loopback() -> tuple[str, bool]:
+    """Return (device_path, loaded_by_us). Empty string on failure."""
+    existing = _find_loopback_devices()
+    if existing:
+        return existing[0], False
+    modprobe = _sbin("modprobe")
+    for prefix in ([], ["pkexec"]):
+        cmd = prefix + [
+            modprobe, "v4l2loopback",
+            "devices=1", "video_nr=10",
+            "card_label=HagibisMonitor", "exclusive_caps=1",
+        ]
+        try:
+            r = subprocess.run(cmd, capture_output=True, timeout=15)
+            if r.returncode == 0:
+                time.sleep(0.3)
+                devs = _find_loopback_devices()
+                return (devs[0], True) if devs else ("", True)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+    return "", False
+
+
+def _unload_v4l2loopback():
+    modprobe = _sbin("modprobe")
+    for prefix in ([], ["pkexec"]):
+        cmd = prefix + [modprobe, "-r", "v4l2loopback"]
+        try:
+            if subprocess.run(cmd, capture_output=True, timeout=10).returncode == 0:
+                return
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+
+
 def _query_device_caps(dev: str) -> dict:
     FMT_MAP = {"MJPG": ("mjpeg", "MJPEG"), "YUY2": ("yuyv422", "YUYV")}
     caps: dict = {}
@@ -166,6 +280,8 @@ def _query_device_caps(dev: str) -> dict:
 
 # ── video preview widget ──────────────────────────────────────────────────────
 class VideoDisplay(QLabel):
+    output_changed = pyqtSignal(float, float, float)  # pan_x, pan_y, zoom
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumSize(640, 360)
@@ -176,6 +292,17 @@ class VideoDisplay(QLabel):
         self._scale_mode: str = "fit"
         self._crop_mode:  str = "full"
         self._bg_color:   QColor = QColor("#1f1f1f")
+
+        self._output_enabled: bool  = False
+        self._output_w:       int   = 1920
+        self._output_h:       int   = 1080
+        self._pan_x:          float = 0.0
+        self._pan_y:          float = 0.0
+        self._zoom:           float = 1.0
+
+        self._drag_pos:    QPoint | None            = None
+        self._drag_pan:    tuple[float, float] | None = None
+        self._canvas_rect: QRect = QRect()
 
     def set_scale_mode(self, mode: str):
         self._scale_mode = mode
@@ -197,6 +324,22 @@ class VideoDisplay(QLabel):
         self._pixmap = None
         self._render_px = None
         self.update()
+
+    def set_output_mode(self, enabled: bool, w: int, h: int):
+        self._output_enabled = enabled
+        self._output_w = w
+        self._output_h = h
+        self.setMouseTracking(enabled)
+        self._refresh()
+
+    def set_pan_zoom(self, pan_x: float, pan_y: float, zoom: float):
+        self._pan_x = pan_x
+        self._pan_y = pan_y
+        self._zoom  = zoom
+        self._refresh()
+
+    def get_pan_zoom(self) -> tuple[float, float, float]:
+        return self._pan_x, self._pan_y, self._zoom
 
     def _cropped(self, px: QPixmap) -> QPixmap:
         if self._crop_mode == "full":
@@ -220,14 +363,26 @@ class VideoDisplay(QLabel):
             return px.copy(0, (sh - nh) // 2, sw, nh)
 
     def _refresh(self):
-        if not self._pixmap:
-            self._render_px = None
-            self.update()
-            return
-        px   = self._cropped(self._pixmap)
         W, H = self.width(), self.height()
         if W == 0 or H == 0:
             return
+        if not self._pixmap:
+            self._render_px = None
+            if self._output_enabled:
+                self._refresh_output(W, H)
+            else:
+                self._canvas_rect = QRect()
+            self.update()
+            return
+        if self._output_enabled:
+            self._refresh_output(W, H)
+        else:
+            self._canvas_rect = QRect()
+            self._refresh_normal(W, H)
+        self.update()
+
+    def _refresh_normal(self, W: int, H: int):
+        px   = self._cropped(self._pixmap)
         fast = Qt.TransformationMode.FastTransformation
         mode = self._scale_mode
 
@@ -262,7 +417,38 @@ class VideoDisplay(QLabel):
             self._render_px = s
             self._render_pt = QPoint((W - s.width()) // 2, (H - s.height()) // 2)
 
-        self.update()
+    def _refresh_output(self, W: int, H: int):
+        """Position source video inside the output canvas area."""
+        out_w, out_h = self._output_w, self._output_h
+        disp_scale = min(W / out_w, H / out_h)
+        canvas_w   = int(out_w * disp_scale)
+        canvas_h   = int(out_h * disp_scale)
+        canvas_x   = (W - canvas_w) // 2
+        canvas_y   = (H - canvas_h) // 2
+        self._canvas_rect = QRect(canvas_x, canvas_y, canvas_w, canvas_h)
+
+        if not self._pixmap:
+            self._render_px = None
+            return
+
+        px = self._cropped(self._pixmap)
+        src_w, src_h = px.width(), px.height()
+        if src_w == 0 or src_h == 0:
+            self._render_px = None
+            return
+
+        draw_scale = min(canvas_w / src_w, canvas_h / src_h) * self._zoom
+        dw = max(1, int(src_w * draw_scale))
+        dh = max(1, int(src_h * draw_scale))
+
+        cx = canvas_x + canvas_w // 2
+        cy = canvas_y + canvas_h // 2
+        dx = cx - dw // 2 + int(self._pan_x * disp_scale)
+        dy = cy - dh // 2 + int(self._pan_y * disp_scale)
+
+        fast = Qt.TransformationMode.FastTransformation
+        self._render_px = px.scaled(dw, dh, Qt.AspectRatioMode.IgnoreAspectRatio, fast)
+        self._render_pt = QPoint(dx, dy)
 
     def resizeEvent(self, event):
         self._refresh()
@@ -270,15 +456,146 @@ class VideoDisplay(QLabel):
     def paintEvent(self, event):
         p = QPainter(self)
         p.fillRect(self.rect(), self._bg_color)
-        if self._render_px is not None:
+
+        if self._output_enabled and not self._canvas_rect.isNull():
+            p.fillRect(self._canvas_rect, self._bg_color)
+            if self._render_px is not None:
+                p.setClipRect(self._canvas_rect)
+                p.drawPixmap(self._render_pt, self._render_px)
+                p.setClipping(False)
+            pen = QPen(QColor("#00e5a0"), 2)
+            p.setPen(pen)
+            p.drawRect(self._canvas_rect.adjusted(1, 1, -1, -1))
+            p.setPen(QColor("#00e5a0"))
+            p.setFont(QFont("sans-serif", 9))
+            p.drawText(
+                self._canvas_rect.x() + 6,
+                self._canvas_rect.y() + 14,
+                f"{self._output_w}×{self._output_h}  {self._zoom:.2f}×",
+            )
+        elif self._render_px is not None:
             p.drawPixmap(self._render_pt, self._render_px)
-        else:
+
+        if self._render_px is None:
             lum = (0.299 * self._bg_color.redF() +
                    0.587 * self._bg_color.greenF() +
                    0.114 * self._bg_color.blueF())
             p.setPen(QColor("#404040") if lum > 0.5 else QColor("#606060"))
             p.setFont(QFont("sans-serif", 20))
             p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "NO SIGNAL")
+
+    def mousePressEvent(self, event):
+        if self._output_enabled and event.button() == Qt.MouseButton.LeftButton:
+            self._drag_pos = event.pos()
+            self._drag_pan = (self._pan_x, self._pan_y)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._output_enabled and self._drag_pos is not None:
+            if not self._canvas_rect.isNull() and self._output_w > 0:
+                disp_scale = self._canvas_rect.width() / self._output_w
+                delta = event.pos() - self._drag_pos
+                self._pan_x = self._drag_pan[0] + delta.x() / disp_scale
+                self._pan_y = self._drag_pan[1] + delta.y() / disp_scale
+                self._refresh()
+                self.output_changed.emit(self._pan_x, self._pan_y, self._zoom)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._output_enabled and event.button() == Qt.MouseButton.LeftButton:
+            self._drag_pos = None
+            self._drag_pan = None
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def wheelEvent(self, event):
+        if self._output_enabled:
+            factor = 1.1 if event.angleDelta().y() > 0 else 1 / 1.1
+            self._zoom = max(0.1, min(20.0, self._zoom * factor))
+            self._refresh()
+            self.output_changed.emit(self._pan_x, self._pan_y, self._zoom)
+            event.accept()
+            return
+        super().wheelEvent(event)
+
+
+# ── modprobe worker ───────────────────────────────────────────────────────────
+class _ModprobeWorker(QThread):
+    done = pyqtSignal(str, bool)  # (device_path_or_empty, loaded_by_us)
+
+    def __init__(self, unload: bool = False):
+        super().__init__()
+        self._unload = unload
+
+    def run(self):
+        if self._unload:
+            _unload_v4l2loopback()
+            self.done.emit("", False)
+        else:
+            dev, by_us = _load_v4l2loopback()
+            self.done.emit(dev, by_us)
+
+
+# ── status bar ────────────────────────────────────────────────────────────────
+class _StatusBar(QWidget):
+    """Full-width status bar widget that locks the output status over the video display."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._video_ref: QWidget | None = None
+
+        self.signal_lbl = QLabel("Initialising…", self)
+        self.fps_lbl    = QLabel("FPS: --", self)
+
+        self._center = QWidget(self)
+        row = QHBoxLayout(self._center)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+        row.addWidget(QLabel("Output:", self._center))
+        self.audio_lbl = QLabel("○ Audio", self._center)
+        self.audio_lbl.setStyleSheet("color: #888888;")
+        row.addWidget(self.audio_lbl)
+        self.video_lbl = QLabel("○ Video", self._center)
+        self.video_lbl.setStyleSheet("color: #888888;")
+        row.addWidget(self.video_lbl)
+
+    def set_video_ref(self, ref: QWidget):
+        self._video_ref = ref
+
+    def relayout(self):
+        self._do_layout()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._do_layout()
+
+    def _do_layout(self):
+        W, H = self.width(), self.height()
+        if W == 0 or H == 0:
+            return
+
+        fps_w = self.fps_lbl.sizeHint().width() + 8
+        self.fps_lbl.setGeometry(W - fps_w, 0, fps_w, H)
+
+        cw = self._center.sizeHint().width()
+        if self._video_ref is not None and self._video_ref.isVisible():
+            try:
+                vx = self._video_ref.mapToGlobal(QPoint(self._video_ref.width() // 2, 0)).x()
+                ox = self.mapToGlobal(QPoint(0, 0)).x()
+                cx = vx - ox - cw // 2
+                cx = max(4, min(W - fps_w - cw - 4, cx))
+            except Exception:
+                cx = max(4, (W - cw) // 2)
+        else:
+            cx = max(4, (W - cw) // 2)
+
+        self._center.setGeometry(cx, 0, cw, H)
+        self.signal_lbl.setGeometry(4, 0, max(0, cx - 8), H)
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -307,14 +624,19 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Hagibis Monitor")
         self.setMinimumSize(960, 580)
 
-        self._video_worker: VideoWorker | None = None
-        self._audio_worker: AudioWorker | None = None
+        self._video_worker:    VideoWorker    | None = None
+        self._audio_worker:    AudioWorker    | None = None
+        self._output_worker:   OutputWorker   | None = None
+        self._modprobe_worker: _ModprobeWorker | None = None
+        self._v4l2_device:       str  = ""
+        self._v4l2_loaded_by_us: bool = False
         self._caps:           dict = {}
         self._pa_sink_input:  int | None = None
         self._pa_poll_count:  int = 0
         self._current_profile: str  = "Default"
         self._dirty:           bool = False
         self._res_tab_selection: dict[str, tuple[int, int]] = {}
+        self._output_settings: OutputSettings = OutputSettings()
 
         self._build_ui()
         self._apply_dark_theme()
@@ -414,11 +736,13 @@ class MainWindow(QMainWindow):
         self._panel_scroll.setWidget(panel)
         root_layout.addWidget(self._panel_scroll)
 
-        self._lbl_signal = QLabel("Initialising…")
-        self._lbl_fps    = QLabel("FPS: --")
-        sb = self.statusBar()
-        sb.addWidget(self._lbl_signal, 1)
-        sb.addPermanentWidget(self._lbl_fps)
+        self._sb = _StatusBar()
+        self._sb.set_video_ref(self._display)
+        self.statusBar().addWidget(self._sb, 1)
+        self._lbl_signal       = self._sb.signal_lbl
+        self._lbl_fps          = self._sb.fps_lbl
+        self._audio_status_lbl = self._sb.audio_lbl
+        self._video_status_lbl = self._sb.video_lbl
 
     def _build_video_tab(self) -> QWidget:
         w = QWidget()
@@ -631,38 +955,34 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(4, 6, 4, 4)
         layout.setSpacing(6)
 
-        self._output_enabled = QCheckBox("Enable Virtual Microphone Output")
-        self._output_enabled.setToolTip(
-            "Creates a virtual microphone in PulseAudio/PipeWire.\n"
-            "Audio from the selected input device is routed through it\n"
-            "with all volume and mono settings from the Audio tab applied."
+        self._out_enabled = QCheckBox("Enable Output")
+        self._out_enabled.setToolTip(
+            "Stream video to a v4l2loopback virtual camera AND create a virtual\n"
+            "audio input device. OBS captures the camera + audio input separately.\n"
+            "Audio uses the Audio tab's volume and mono mix settings."
         )
-        self._output_enabled.stateChanged.connect(self._on_output_toggle)
-        layout.addWidget(self._output_enabled)
+        self._out_enabled.stateChanged.connect(self._on_out_enable_changed)
+        layout.addWidget(self._out_enabled)
 
-        obs_grp = QGroupBox("OBS Setup")
+        obs_grp = QGroupBox("OBS Audio Setup")
         ol = QVBoxLayout(obs_grp)
         ol.addWidget(QLabel(
             "In OBS, add an Audio Input Capture source\n"
             "and select the device named below:"
         ))
-
-        device_row = QHBoxLayout()
+        audio_dev_row = QHBoxLayout()
         self._output_device_edit = QLineEdit(AudioWorker.SOURCE_NAME)
         self._output_device_edit.setReadOnly(True)
-        device_row.addWidget(self._output_device_edit, 1)
+        audio_dev_row.addWidget(self._output_device_edit, 1)
         copy_btn = QPushButton("Copy")
         copy_btn.setFixedWidth(52)
         copy_btn.setToolTip("Copy device name to clipboard")
         copy_btn.clicked.connect(
             lambda: QApplication.clipboard().setText(self._output_device_edit.text())
         )
-        device_row.addWidget(copy_btn)
-        ol.addLayout(device_row)
-
+        audio_dev_row.addWidget(copy_btn)
+        ol.addLayout(audio_dev_row)
         note = QLabel(
-            "In OBS select Sources → Audio Input Capture\n"
-            "and look for \"Hagibis Virtual Microphone\".\n\n"
             "Master volume, channel volumes, and mono mix\n"
             "from the Audio tab are all applied."
         )
@@ -670,9 +990,104 @@ class MainWindow(QMainWindow):
         ol.addWidget(note)
         layout.addWidget(obs_grp)
 
-        self._output_status_lbl = QLabel("○ Inactive")
-        self._output_status_lbl.setStyleSheet("color: #888888;")
-        layout.addWidget(self._output_status_lbl)
+        vid_grp = QGroupBox("OBS Video Setup")
+        vgl = QVBoxLayout(vid_grp)
+        vgl.addWidget(QLabel(
+            "In OBS, add a Video Capture Device source\n"
+            "and select the device named below:"
+        ))
+        vid_dev_row = QHBoxLayout()
+        self._output_video_combo = QComboBox()
+        self._output_video_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        vid_dev_row.addWidget(self._output_video_combo, 1)
+        refresh_vid_btn = QPushButton("↻")
+        refresh_vid_btn.setFixedWidth(32)
+        refresh_vid_btn.setToolTip("Re-scan for loopback devices")
+        refresh_vid_btn.clicked.connect(self._refresh_output_video_devices)
+        vid_dev_row.addWidget(refresh_vid_btn)
+        copy_vid_btn = QPushButton("Copy")
+        copy_vid_btn.setFixedWidth(52)
+        copy_vid_btn.setToolTip("Copy selected device path to clipboard")
+        copy_vid_btn.clicked.connect(
+            lambda: QApplication.clipboard().setText(
+                self._output_video_combo.currentData() or ""
+            )
+        )
+        vid_dev_row.addWidget(copy_vid_btn)
+        vgl.addLayout(vid_dev_row)
+        self._out_setup_lbl = QLabel(
+            "v4l2loopback module not installed.\n\n"
+            "Install it with:\n"
+            "  sudo apt install v4l2loopback-dkms\n\n"
+            "Then re-open this app."
+        )
+        self._out_setup_lbl.setStyleSheet("color: #f0a000; font-size: 10px;")
+        self._out_setup_lbl.setWordWrap(True)
+        self._out_setup_lbl.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self._out_setup_lbl.setVisible(not _v4l2loopback_installed())
+        vgl.addWidget(self._out_setup_lbl)
+        layout.addWidget(vid_grp)
+
+        res_grp = QGroupBox("Output Resolution")
+        rgl = QVBoxLayout(res_grp)
+        self._out_res_aspect_bar = QTabBar()
+        self._out_res_aspect_bar.setExpanding(False)
+        self._out_res_aspect_bar.setUsesScrollButtons(True)
+        for aspect in _OUTPUT_RESOLUTIONS:
+            self._out_res_aspect_bar.addTab(aspect)
+        rgl.addWidget(self._out_res_aspect_bar)
+        self._out_res_combo = QComboBox()
+        rgl.addWidget(self._out_res_combo)
+        self._out_res_aspect_bar.currentChanged.connect(self._on_out_res_aspect_changed)
+        self._out_res_combo.currentIndexChanged.connect(self._on_out_res_changed)
+        self._fill_out_res_combo()
+        layout.addWidget(res_grp)
+
+        fmt_grp = QGroupBox("Pixel Format")
+        fgl = QVBoxLayout(fmt_grp)
+        self._out_pix_fmt_combo = QComboBox()
+        for label, key in _OUTPUT_PIXEL_FORMATS:
+            self._out_pix_fmt_combo.addItem(label, key)
+        self._out_pix_fmt_combo.currentIndexChanged.connect(self._on_out_settings_changed)
+        fgl.addWidget(self._out_pix_fmt_combo)
+        layout.addWidget(fmt_grp)
+
+        fps_grp = QGroupBox("Frame Rate")
+        fpgl = QVBoxLayout(fps_grp)
+        self._out_fps_combo = QComboBox()
+        for fps in _OUTPUT_FPS:
+            self._out_fps_combo.addItem(f"{fps} fps", fps)
+        self._out_fps_combo.currentIndexChanged.connect(self._on_out_settings_changed)
+        fpgl.addWidget(self._out_fps_combo)
+        layout.addWidget(fps_grp)
+
+        pz_grp = QGroupBox("Pan / Zoom")
+        pzl = QVBoxLayout(pz_grp)
+        hint = QLabel("Drag the preview to pan · scroll to zoom")
+        hint.setStyleSheet("color: #888; font-size: 10px;")
+        pzl.addWidget(hint)
+        pz_row = QHBoxLayout()
+        pz_row.addWidget(QLabel("Pan X:"))
+        self._out_pan_x_lbl = QLabel("0.0")
+        self._out_pan_x_lbl.setFixedWidth(46)
+        pz_row.addWidget(self._out_pan_x_lbl)
+        pz_row.addWidget(QLabel("Y:"))
+        self._out_pan_y_lbl = QLabel("0.0")
+        self._out_pan_y_lbl.setFixedWidth(46)
+        pz_row.addWidget(self._out_pan_y_lbl)
+        pz_row.addWidget(QLabel("Zoom:"))
+        self._out_zoom_lbl = QLabel("1.00×")
+        self._out_zoom_lbl.setFixedWidth(46)
+        pz_row.addWidget(self._out_zoom_lbl)
+        pzl.addLayout(pz_row)
+        reset_pz_btn = QPushButton("Reset Pan / Zoom")
+        reset_pz_btn.clicked.connect(self._reset_output_pan_zoom)
+        pzl.addWidget(reset_pz_btn)
+        layout.addWidget(pz_grp)
 
         layout.addStretch()
         return w
@@ -787,7 +1202,6 @@ class MainWindow(QMainWindow):
             volume_db     = self._vol_slider.value(),
             volume_l_db   = self._vol_l_slider.value(),
             volume_r_db   = self._vol_r_slider.value(),
-            output_enabled = self._output_enabled.isChecked(),
         )
 
     def _load_from_disk(self, name: str) -> AppSettings:
@@ -851,7 +1265,6 @@ class MainWindow(QMainWindow):
             volume_db     = aud("volume_db",   0,     int),
             volume_l_db   = aud("volume_l_db", 0,     int),
             volume_r_db   = aud("volume_r_db", 0,     int),
-            output_enabled = aud("output_enabled", False, bool),
         )
 
     def _save_to_disk(self, settings: AppSettings, name: str):
@@ -874,7 +1287,6 @@ class MainWindow(QMainWindow):
         s.setValue("audio/volume_db",      settings.volume_db)
         s.setValue("audio/volume_l_db",    settings.volume_l_db)
         s.setValue("audio/volume_r_db",    settings.volume_r_db)
-        s.setValue("audio/output_enabled", settings.output_enabled)
         s.sync()
 
     def _apply_settings(self, settings: AppSettings):
@@ -930,7 +1342,6 @@ class MainWindow(QMainWindow):
             (self._audio_enabled,  settings.audio_enabled),
             (self._mono_mix,       settings.mono_mix),
             (self._passthrough,    settings.passthrough),
-            (self._output_enabled, settings.output_enabled),
         ]:
             widget.blockSignals(True)
             widget.setChecked(val)
@@ -1092,6 +1503,10 @@ class MainWindow(QMainWindow):
         self._apply_settings(settings)
         self._clear_dirty()
 
+        self._load_output_settings(gs)
+        self._apply_output_settings_to_ui()
+        self._display.output_changed.connect(self._on_output_changed)
+
     def _save_global(self):
         gs = QSettings("HagibisMonitor", "HagibisMonitor")
         gs.setValue("window/geometry",     self.saveGeometry())
@@ -1237,6 +1652,7 @@ class MainWindow(QMainWindow):
         wk = VideoWorker()
         wk.configure(w, h, fps, fmt, dev)
         wk.frame_ready.connect(self._display.set_frame)
+        wk.frame_ready.connect(self._feed_output)
         wk.fps_updated.connect(lambda f: self._lbl_fps.setText(f"FPS: {f:.1f}"))
         wk.error.connect(lambda e: self._lbl_signal.setText(f"Error: {e}"))
         self._video_worker = wk
@@ -1301,7 +1717,7 @@ class MainWindow(QMainWindow):
         wk.device          = self._audio_device_combo.currentData() or "plughw:Hagibis,0"
         wk.mono_mix        = self._mono_mix.isChecked()
         wk.passthrough     = self._passthrough.isChecked()
-        wk.virtual_output  = self._output_enabled.isChecked()
+        wk.virtual_output  = self._out_enabled.isChecked()
         wk.volume_db       = self._vol_slider.value()
         wk.volume_l_db     = self._vol_l_slider.value()
         wk.volume_r_db     = self._vol_r_slider.value()
@@ -1329,7 +1745,6 @@ class MainWindow(QMainWindow):
         else:
             self._stop_audio()
         self._update_vol_slider_states()
-        self._update_output_status()
         self._mark_dirty()
 
     def _on_audio_opt_change(self):
@@ -1337,21 +1752,233 @@ class MainWindow(QMainWindow):
             self._start_audio()
         self._mark_dirty()
 
-    # ── virtual output ────────────────────────────────────────────────────────
-    def _on_output_toggle(self, state: int):
-        if self._audio_enabled.isChecked():
-            self._start_audio()  # restart worker with new virtual_output value
+    # ── output tab helpers ────────────────────────────────────────────────────
+
+    def _populate_output_video_combo(self, select_dev: str = ""):
+        self._output_video_combo.blockSignals(True)
+        self._output_video_combo.clear()
+        for dev in _find_loopback_devices():
+            self._output_video_combo.addItem(dev, dev)
+        if select_dev:
+            for i in range(self._output_video_combo.count()):
+                if self._output_video_combo.itemData(i) == select_dev:
+                    self._output_video_combo.setCurrentIndex(i)
+                    break
+        self._output_video_combo.blockSignals(False)
+
+    def _refresh_output_video_devices(self):
+        current = self._output_video_combo.currentData() or ""
+        self._populate_output_video_combo(current)
+
+    def _fill_out_res_combo(self):
+        self._out_res_combo.blockSignals(True)
+        self._out_res_combo.clear()
+        tab_idx = self._out_res_aspect_bar.currentIndex()
+        if tab_idx >= 0:
+            aspect = self._out_res_aspect_bar.tabText(tab_idx)
+            for label, w, h in _OUTPUT_RESOLUTIONS.get(aspect, []):
+                self._out_res_combo.addItem(label, (w, h))
+        self._out_res_combo.blockSignals(False)
+
+    def _on_out_res_aspect_changed(self):
+        self._fill_out_res_combo()
+        self._on_out_settings_changed()
+
+    def _on_out_res_changed(self):
+        self._on_out_settings_changed()
+
+    def _on_out_settings_changed(self):
+        if self._out_enabled.isChecked():
+            self._restart_output()
+
+    def _on_out_enable_changed(self, state: int):
+        enabled = state == Qt.CheckState.Checked.value
+        if enabled:
+            selected = self._output_video_combo.currentData() or ""
+            if selected:
+                self._on_v4l2_loaded(selected, False)
+            else:
+                self._lbl_signal.setText("Loading v4l2loopback…")
+                worker = _ModprobeWorker(unload=False)
+                worker.done.connect(self._on_v4l2_loaded)
+                self._modprobe_worker = worker
+                worker.start()
+        else:
+            self._stop_output()
+            w, h = self._out_res_combo.currentData() or (1920, 1080)
+            self._display.set_output_mode(False, w, h)
+            if self._v4l2_device:
+                worker = _ModprobeWorker(unload=True)
+                worker.done.connect(lambda *_: None)
+                self._modprobe_worker = worker
+                worker.start()
+                self._v4l2_device = ""
+                self._v4l2_loaded_by_us = False
+            if self._audio_enabled.isChecked():
+                self._start_audio()
+            self._update_output_status()
+            self._save_output_settings()
+
+    def _on_v4l2_loaded(self, dev: str, loaded_by_us: bool):
+        if dev:
+            self._v4l2_device = dev
+            self._v4l2_loaded_by_us = loaded_by_us
+            self._populate_output_video_combo(dev)
+            w, h = self._out_res_combo.currentData() or (1920, 1080)
+            self._display.set_output_mode(True, w, h)
+            self._start_output()
+            if self._audio_enabled.isChecked():
+                self._start_audio()
+        else:
+            self._v4l2_device = ""
+            self._v4l2_loaded_by_us = False
+            self._lbl_signal.setText(
+                "Failed to load v4l2loopback — install v4l2loopback-dkms and grant permission"
+            )
+            w, h = self._out_res_combo.currentData() or (1920, 1080)
+            self._display.set_output_mode(True, w, h)
+            if self._audio_enabled.isChecked():
+                self._start_audio()
         self._update_output_status()
-        self._mark_dirty()
+        self._save_output_settings()
 
     def _update_output_status(self):
-        active = self._audio_enabled.isChecked() and self._output_enabled.isChecked()
-        if active:
-            self._output_status_lbl.setText("● Active")
-            self._output_status_lbl.setStyleSheet("color: #50c878;")
+        audio_active = self._out_enabled.isChecked() and self._audio_worker is not None
+        if audio_active:
+            self._audio_status_lbl.setText("● Audio")
+            self._audio_status_lbl.setStyleSheet("color: #50c878;")
         else:
-            self._output_status_lbl.setText("○ Inactive")
-            self._output_status_lbl.setStyleSheet("color: #888888;")
+            self._audio_status_lbl.setText("○ Audio")
+            self._audio_status_lbl.setStyleSheet("color: #888888;")
+
+        video_active = self._out_enabled.isChecked() and self._output_worker is not None
+        if video_active:
+            self._video_status_lbl.setText("● Video")
+            self._video_status_lbl.setStyleSheet("color: #50c878;")
+        else:
+            self._video_status_lbl.setText("○ Video")
+            self._video_status_lbl.setStyleSheet("color: #888888;")
+
+    def _reset_output_pan_zoom(self):
+        self._display.set_pan_zoom(0.0, 0.0, 1.0)
+        self._out_pan_x_lbl.setText("0.0")
+        self._out_pan_y_lbl.setText("0.0")
+        self._out_zoom_lbl.setText("1.00×")
+        self._save_output_settings()
+
+    def _on_output_changed(self, pan_x: float, pan_y: float, zoom: float):
+        self._out_pan_x_lbl.setText(f"{pan_x:.1f}")
+        self._out_pan_y_lbl.setText(f"{pan_y:.1f}")
+        self._out_zoom_lbl.setText(f"{zoom:.2f}×")
+        self._save_output_settings()
+
+    # ── output stream management ──────────────────────────────────────────────
+
+    def _start_output(self):
+        self._stop_output()
+        dev = self._v4l2_device
+        if not dev:
+            self._update_output_status()
+            return
+        w, h = self._out_res_combo.currentData() or (1920, 1080)
+        fmt  = self._out_pix_fmt_combo.currentData() or "yuyv422"
+        fps  = self._out_fps_combo.currentData() or 30
+        wk = OutputWorker(dev, w, h, fps, fmt)
+        wk.error.connect(lambda e: self._lbl_signal.setText(f"Output error: {e}"))
+        self._output_worker = wk
+        wk.start()
+        self._update_output_status()
+
+    def _stop_output(self):
+        if self._output_worker:
+            self._output_worker.stop()
+            self._output_worker.wait(3000)
+            self._output_worker = None
+        self._update_output_status()
+
+    def _restart_output(self):
+        if self._out_enabled.isChecked():
+            w, h = self._out_res_combo.currentData() or (1920, 1080)
+            self._display.set_output_mode(True, w, h)
+            self._start_output()
+
+    def _feed_output(self, img: QImage):
+        if self._output_worker is not None:
+            pan_x, pan_y, zoom = self._display.get_pan_zoom()
+            self._output_worker.push_frame(img, pan_x, pan_y, zoom, self._display._bg_color)
+
+    # ── output global settings I/O ────────────────────────────────────────────
+
+    def _load_output_settings(self, gs: QSettings):
+        def _b(k, d): return gs.value(f"output/{k}", d, type=bool)
+        def _i(k, d):
+            try: return int(gs.value(f"output/{k}", d))
+            except (TypeError, ValueError): return d
+        def _f(k, d):
+            try: return float(gs.value(f"output/{k}", d))
+            except (TypeError, ValueError): return d
+        def _s(k, d):
+            v = gs.value(f"output/{k}"); return v if v is not None else d
+
+        self._output_settings = OutputSettings(
+            enabled      = _b("enabled",      False),
+            device       = _s("device",       ""),
+            width        = _i("width",         1920),
+            height       = _i("height",        1080),
+            pixel_format = _s("pixel_format",  "yuyv422"),
+            fps          = _i("fps",           30),
+            pan_x        = _f("pan_x",         0.0),
+            pan_y        = _f("pan_y",         0.0),
+            zoom         = _f("zoom",          1.0),
+        )
+
+    def _apply_output_settings_to_ui(self):
+        os = self._output_settings
+        target_aspect = None
+        for aspect, entries in _OUTPUT_RESOLUTIONS.items():
+            for _, w, h in entries:
+                if w == os.width and h == os.height:
+                    target_aspect = aspect
+                    break
+            if target_aspect:
+                break
+        if target_aspect:
+            for i in range(self._out_res_aspect_bar.count()):
+                if self._out_res_aspect_bar.tabText(i) == target_aspect:
+                    self._out_res_aspect_bar.blockSignals(True)
+                    self._out_res_aspect_bar.setCurrentIndex(i)
+                    self._out_res_aspect_bar.blockSignals(False)
+                    break
+            self._fill_out_res_combo()
+            self._select_combo_by_data(self._out_res_combo, (os.width, os.height))
+
+        self._populate_output_video_combo(os.device)
+        self._select_combo(self._out_pix_fmt_combo, os.pixel_format)
+        self._select_combo_by_data(self._out_fps_combo, os.fps)
+
+        self._display.set_pan_zoom(os.pan_x, os.pan_y, os.zoom)
+        self._out_pan_x_lbl.setText(f"{os.pan_x:.1f}")
+        self._out_pan_y_lbl.setText(f"{os.pan_y:.1f}")
+        self._out_zoom_lbl.setText(f"{os.zoom:.2f}×")
+
+        self._out_enabled.blockSignals(True)
+        self._out_enabled.setChecked(False)
+        self._out_enabled.blockSignals(False)
+
+    def _save_output_settings(self):
+        pan_x, pan_y, zoom = self._display.get_pan_zoom()
+        w, h = self._out_res_combo.currentData() or (1920, 1080)
+        gs = QSettings("HagibisMonitor", "HagibisMonitor")
+        gs.setValue("output/enabled",      self._out_enabled.isChecked())
+        gs.setValue("output/device",       self._v4l2_device)
+        gs.setValue("output/width",        w)
+        gs.setValue("output/height",       h)
+        gs.setValue("output/pixel_format", self._out_pix_fmt_combo.currentData() or "yuyv422")
+        gs.setValue("output/fps",          self._out_fps_combo.currentData() or 30)
+        gs.setValue("output/pan_x",        pan_x)
+        gs.setValue("output/pan_y",        pan_y)
+        gs.setValue("output/zoom",         zoom)
+        gs.sync()
 
     def _update_vol_slider_states(self):
         on = self._audio_enabled.isChecked()
@@ -1433,13 +2060,19 @@ class MainWindow(QMainWindow):
         self._panel_scroll.setVisible(visible)
         self._panel_toggle.setText("◀" if visible else "▶")
         self._save_global()
+        QTimer.singleShot(0, self._sb.relayout)
 
     # ── window close ──────────────────────────────────────────────────────────
     def closeEvent(self, event):
+        self._save_output_settings()
         self._save_global()
         self._save_to_disk(self._collect_settings(), self._current_profile)
+        self._stop_output()
         self._stop_audio()
         self._stop_video()
+        if self._v4l2_device:
+            _unload_v4l2loopback()
+            self._v4l2_device = ""
         event.accept()
 
 
