@@ -22,8 +22,9 @@ V4L2-compatible capture device.
 7. [Profiles](#profiles)
 8. [Video display options](#video-display-options)
 9. [Audio](#audio)
-10. [Known quirks and gotchas](#known-quirks-and-gotchas)
-11. [AI context — read this if you are a future assistant](#ai-context--read-this-if-you-are-a-future-assistant)
+10. [Output (virtual camera + virtual mic)](#output-virtual-camera--virtual-mic)
+11. [Known quirks and gotchas](#known-quirks-and-gotchas)
+12. [AI context — read this if you are a future assistant](#ai-context--read-this-if-you-are-a-future-assistant)
 
 ---
 
@@ -69,13 +70,30 @@ V4L2-compatible capture device.
 - **VU meters** — stereo L/R segmented meters with peak hold and 0.4 dB/update
   decay, driven by per-chunk RMS of the raw s16le PCM.
 - **Mono Mix** — sums L+R into a mono signal on both channels (useful for
-  single-channel console audio).
+  single-channel console audio). Requires ffmpeg restart to apply.
 - **Audio Passthrough** — routes captured audio to the default
   PulseAudio/PipeWire sink using ffmpeg's `asplit` filter. Volume is applied
   in real time via `pactl set-sink-input-volume`.
+- **Virtual Microphone** — when Output is enabled, creates a persistent
+  PulseAudio virtual source (`hagibis_virtual`) that other apps (e.g. OBS,
+  Discord) can use as a microphone input. Volume is applied in real time via
+  `pactl set-sink-volume hagibis_bus` without restarting ffmpeg.
 - **Master + per-channel volume** — master fader (−40 to +10 dB) and
   independent L/R trims (−20 to +20 dB). VU meters reflect volume changes
-  instantly while dragging; speaker output follows via pactl.
+  instantly while dragging.
+
+### Output (virtual camera)
+- **v4l2loopback virtual camera** — writes the processed video feed to a
+  `/dev/videoN` loopback device. OBS and other apps can read from it.
+- **Separate output scale / crop** — independent scale mode and crop for the
+  loopback output, stored per-profile.
+- **Pan / zoom** — adjustable pan and zoom applied to both the preview and the
+  loopback output, stored per-profile.
+- **Output resolution / format / fps** — configurable globally (not per-profile).
+  All standard resolutions are advertised to readers.
+- **Persistent virtual source** — the PulseAudio virtual mic modules are kept
+  alive across audio worker restarts. OBS never loses the device when volume
+  or mono settings change.
 
 ### Profiles
 - Named profiles stored as individual INI files under
@@ -94,7 +112,7 @@ V4L2-compatible capture device.
 ```
 hagibis-monitor/
 ├── main.py       # Entry point, MainWindow, VideoDisplay, AppSettings, profiles
-├── workers.py    # VideoWorker and AudioWorker (QThread subclasses)
+├── workers.py    # VideoWorker, AudioWorker, OutputWorker (QThread subclasses)
 ├── vu_meter.py   # VuMeter, DbScale, StereoVuMeter custom widgets
 ├── .gitignore
 └── .vscode/
@@ -104,7 +122,7 @@ hagibis-monitor/
 Settings are stored in:
 ```
 ~/.config/HagibisMonitor/
-├── HagibisMonitor.ini        # window geometry + active profile name only
+├── HagibisMonitor.ini        # window geometry + output settings (global)
 └── profiles/
     ├── Default.ini           # always present; created on first launch
     ├── GBC.ini               # example user profile
@@ -117,12 +135,16 @@ Key components:
 
 **`AppSettings` (dataclass)** — flat struct holding every profile-able value:
 panel visibility, scale/crop/bg_color, video device, fmt/res/fps/image
-controls, audio device, audio enabled, mono mix, passthrough, and three
-volume levels.
+controls, audio device, audio enabled, mono mix, passthrough, three volume
+levels, output scale/crop modes, and pan/zoom.
+
+**`OutputSettings` (dataclass)** — globally-stored output settings: enabled
+flag, loopback device path, width, height, pixel format, fps. Always starts
+disabled on launch regardless of saved state.
 
 **`VideoDisplay(QLabel)`** — renders frames via `paintEvent` using a
 pre-computed `(QPixmap, QPoint)` pair. Supports all twelve scale modes and
-four crop modes independently.
+four crop modes independently for both display and loopback output.
 
 **`MainWindow`** — builds the UI, owns the workers, manages profiles.
 Key I/O methods:
@@ -136,20 +158,27 @@ Key I/O methods:
 
 **`VideoWorker(QThread)`**:
 - Spawns `ffmpeg -f v4l2 … -f rawvideo -pix_fmt rgb24 -`.
-- Reads `width × height × 3` bytes per frame; uses an inner accumulation
-  loop to handle partial `os.read()` returns (same pattern as `AudioWorker`).
+- Reads `width × height × 3` bytes per frame.
 - Emits `frame_ready(QImage)` and `fps_updated(float)`.
-- Device, format, resolution and framerate are set via `configure()`.
 
 **`AudioWorker(QThread)`**:
 - Spawns ffmpeg reading from `self.device` (ALSA `plughw:` address).
-- Without passthrough: pipes raw s16le PCM to stdout.
-- With passthrough: `[0:a]<pan?>asplit=2[vu][out]` — `[vu]` to stdout,
-  `[out]` to PulseAudio. Volume for the speaker output is controlled
-  separately via `pactl` after the process starts.
+- Without passthrough/virtual: pipes raw s16le PCM to stdout for VU meters.
+- With passthrough: `asplit` sends a copy to the default PulseAudio sink.
+- With virtual output: `asplit` sends a copy via a pipe to `pacat`, which
+  writes to the `hagibis_bus` null-sink. A virtual source (`hagibis_virtual`)
+  remaps from `hagibis_bus.monitor` for use by OBS/Discord/etc.
+- PA modules (`hagibis_bus` + `hagibis_virtual`) are kept alive across worker
+  restarts via `_find_existing_modules()`. `teardown()` must be called
+  explicitly to unload them (on output disable or app close).
 - Python applies `10^((master_db + channel_trim) / 20)` gain to the stdout
   PCM before RMS computation, giving real-time VU response while dragging.
-- Exposes `proc_pid` property so `MainWindow` can find the pactl sink input.
+
+**`OutputWorker(QThread)`**:
+- Spawns `ffmpeg -f rawvideo … -f v4l2 /dev/videoN`.
+- Receives frames via `push_frame()` with a drop-newest queue (size 4).
+- Uses a monotonic-clock pacing loop to write frames at exactly the target fps.
+- Applies pan, zoom, scale mode, and crop mode per frame via QPainter.
 
 ### vu_meter.py
 
@@ -175,8 +204,10 @@ Key I/O methods:
 | ffmpeg | Video + audio capture pipelines | `which ffmpeg` |
 | v4l2-ctl | Device enumeration + image controls | `which v4l2-ctl` |
 | arecord | ALSA capture device enumeration | `which arecord` |
-| pactl | Real-time speaker volume control | `which pactl` |
+| pactl | Real-time volume control + PA module management | `which pactl` |
+| pacat | Pipe PCM into PulseAudio sink (virtual mic) | `which pacat` |
 | xdg-open | Open config folder button | `which xdg-open` |
+| v4l2loopback | Virtual camera device (optional) | `modinfo v4l2loopback` |
 
 Install missing Python packages:
 ```bash
@@ -185,11 +216,15 @@ pip install PyQt6 numpy
 
 Install system tools (Debian/Ubuntu):
 ```bash
-sudo apt install ffmpeg v4l2-utils alsa-utils
+sudo apt install ffmpeg v4l2-utils alsa-utils pulseaudio-utils
 ```
 
-`pactl` and `xdg-open` are part of `pulseaudio-utils` and `xdg-utils`
-respectively, both usually pre-installed on desktop systems.
+For the virtual camera output feature:
+```bash
+sudo apt install v4l2loopback-dkms
+```
+
+`xdg-open` is part of `xdg-utils`, usually pre-installed on desktop systems.
 
 ---
 
@@ -215,7 +250,7 @@ There is no install step.
 │                                                   │ [Save Profile][Revert]│
 │                                                   │ [⎆]  ● unsaved       │
 │                                                   ├──────────────────────┤
-│              Live video preview                   │  [Video]  [Audio]    │
+│              Live video preview                   │ [Video][Audio][Output]│
 │            (scale + crop applied)                 │ ┌──────────────────┐ │
 │                                                   │ │ Capture Settings │ │
 │                                                   │ │  Device  ▾  [↻]  │ │
@@ -272,6 +307,34 @@ The ◀ strip on the right edge of the video area collapses/expands the panel.
 └──────────────────────────────┘
 ```
 
+**Output tab:**
+```
+┌──────────────────────────────┐
+│ ☐ Enable Output              │
+│ ┌─ Video Device ───────────┐ │
+│ │ [/dev/video10 ▾]  [↻][⧉]│ │
+│ └──────────────────────────┘ │
+│ ┌─ Format ─────────────────┐ │
+│ │  [16:9][4:3]…            │ │
+│ │  Resolution ▾            │ │
+│ │  Pixel Format ▾          │ │
+│ │  Frame Rate ▾            │ │
+│ └──────────────────────────┘ │
+│ ┌─ Scale & Crop ───────────┐ │
+│ │  Scale Mode ▾            │ │
+│ │  Crop       ▾            │ │
+│ └──────────────────────────┘ │
+│ ┌─ Pan / Zoom ─────────────┐ │
+│ │  X [━━━●━━]  Y [━━━●━━] │ │
+│ │  Zoom [━━━●━━]  [Reset]  │ │
+│ └──────────────────────────┘ │
+│  ● Video  ● Audio            │
+└──────────────────────────────┘
+```
+
+When output is enabled and v4l2loopback is loaded, the status line at the
+bottom shows `● Video` and `● Audio` indicators.
+
 ---
 
 ## Profiles
@@ -307,8 +370,13 @@ the app closes, so the last session is always restored.
 | Image Controls | Brightness, Contrast, Saturation, Hue |
 | Audio | Audio device, Enable monitoring, Mono Mix, Passthrough |
 | Volume | Master, Left trim, Right trim |
+| Output display | Output Scale Mode, Output Crop |
+| Pan / Zoom | Pan X, Pan Y, Zoom (applies to both preview and loopback output) |
 
-Window size and position are global (not per-profile).
+Output device, resolution, pixel format, and fps are **global** (not
+per-profile). The output enabled state always starts as disabled on launch.
+
+Window size and position are also global (not per-profile).
 
 ---
 
@@ -324,6 +392,9 @@ Window size and position are global (not per-profile).
 | Native (1:1 Pixels) | No scaling; centre-cropped by window edges |
 | Fit to 16:9 / 10:9 / 5:4 / 4:3 Area | Constrain to that ratio's sub-rect; video keeps its own ratio inside it |
 | Stretch to 16:9 / 10:9 / 5:4 / 4:3 Area | Same sub-rect, but video is stretched to fill it exactly |
+
+The Output tab has its own independent Scale Mode and Crop selection, so the
+loopback output can be framed differently from the on-screen preview.
 
 ### Crop
 
@@ -360,6 +431,10 @@ pan=stereo|c0=0.5*c0+0.5*c1|c1=0.5*c0+0.5*c1
 | Truly mono (1-ch ALSA) | Duplicated to both speakers |
 | Full stereo | Collapsed to centred mono |
 
+Changing Mono Mix restarts ffmpeg. Because the PulseAudio virtual source
+modules are kept alive across restarts, OBS does not lose its microphone
+device connection during this restart.
+
 ### Passthrough & volume
 
 When Passthrough is enabled, ffmpeg uses `asplit` to split the stream:
@@ -370,11 +445,28 @@ When Passthrough is enabled, ffmpeg uses `asplit` to split the stream:
 ```
 
 Speaker volume is controlled in real time via `pactl set-sink-input-volume`
-after the ffmpeg sink input is located by PID. This means dragging any
-volume slider updates the speakers immediately without restarting ffmpeg.
+after the ffmpeg sink input is located by PID.
 
-VU meters always show the post-volume level (Python applies the same gain
-to the PCM before computing RMS), so meters and speakers stay in sync.
+### Virtual Microphone
+
+When **Output** is enabled, a second split is added and `pacat` is used to
+pipe PCM into a PulseAudio null-sink (`hagibis_bus`). A virtual source
+(`hagibis_virtual`) remaps from its monitor:
+
+```
+ffmpeg → pipe → pacat → hagibis_bus (null-sink)
+                              ↓ monitor
+                       hagibis_virtual (remap-source) → OBS / Discord / …
+```
+
+Volume for the virtual mic is controlled in real time via
+`pactl set-sink-volume hagibis_bus`, targeting the null-sink directly (more
+reliable in PipeWire than setting volume on the virtual source).
+
+The `hagibis_bus` and `hagibis_virtual` PA modules are **persistent** — they
+are not unloaded when the audio worker restarts (e.g. when changing Mono Mix
+or volume). They are only unloaded when Output is explicitly disabled or the
+app closes.
 
 ### Volume controls
 
@@ -383,6 +475,47 @@ to the PCM before computing RMS), so meters and speakers stay in sync.
 | Master | −40 to +10 dB | Both channels uniformly |
 | Left trim | −20 to +20 dB | Left channel only (additive with master) |
 | Right trim | −20 to +20 dB | Right channel only (additive with master) |
+
+Dragging any volume slider immediately updates:
+- The VU meter display (Python-side gain applied to PCM before RMS)
+- The passthrough speaker level (via `pactl set-sink-input-volume`)
+- The virtual mic level (via `pactl set-sink-volume hagibis_bus`)
+
+---
+
+## Output (virtual camera + virtual mic)
+
+### Virtual camera
+
+Enabling Output loads `v4l2loopback` (via `modprobe`, using `pkexec` for
+privilege escalation if needed) and starts `OutputWorker`, which writes
+processed frames to the loopback device at the selected resolution and fps.
+
+The loopback device is loaded without `exclusive_caps`, so it advertises the
+full standard set of V4L2 resolutions and formats. OBS and other readers see
+all resolutions in their device settings.
+
+When the output resolution is changed, the app:
+1. Stops OutputWorker (closes the write side — triggers `V4L2_EVENT_SOURCE_CHANGE` to readers)
+2. Waits 150 ms for readers to react
+3. Starts a new OutputWorker at the new resolution
+
+OBS handles `V4L2_EVENT_SOURCE_CHANGE` by automatically restarting its
+capture pipeline with the updated format.
+
+### Virtual microphone
+
+See [Virtual Microphone](#virtual-microphone) in the Audio section above.
+
+### Output status indicators
+
+The status bar at the bottom of the window shows:
+
+| Indicator | Meaning |
+|---|---|
+| `● Video` (green) | OutputWorker is running and writing to the loopback device |
+| `● Audio` (green) | AudioWorker is running with virtual output enabled |
+| Grey / absent | That output is not active |
 
 ---
 
@@ -405,10 +538,28 @@ with `v4l2-ctl` persist in the driver until the device is replugged. The app
 re-applies all image control values from the active profile each time a
 profile is loaded or the video stream is restarted.
 
-**pactl sink input lookup delay** — after audio starts, the app polls for the
-ffmpeg sink input every 80 ms for up to ~3 s. During this window, the speaker
-volume is at the hardware default (100%). Once found, all volume slider
-positions are applied immediately.
+**pactl sink input lookup delay** — after audio starts with passthrough
+enabled, the app polls for the ffmpeg sink input every 80 ms for up to ~3 s.
+During this window, the speaker volume is at the hardware default (100%).
+Once found, all volume slider positions are applied immediately.
+
+**Virtual mic volume applied after 500 ms** — when the audio worker starts
+with virtual output enabled, the app waits 500 ms before calling
+`pactl set-sink-volume hagibis_bus` to allow pacat time to connect to the
+sink. During this window the virtual mic is at 100% volume.
+
+**v4l2loopback requires a kernel module** — if the module is not installed,
+enabling Output will show an error. Install `v4l2loopback-dkms` and grant
+permission via the `pkexec` prompt. The module is loaded once and left loaded
+for the session; the app never unloads it.
+
+**v4l2loopback module loaded with old exclusive_caps** — if the module was
+previously loaded with `exclusive_caps=1` (e.g. from a prior session), OBS
+will only see one resolution. Reload the module:
+```bash
+sudo modprobe -r v4l2loopback
+# then re-enable Output in the app
+```
 
 **60 fps in MJPEG at 1920×1080** — confirmed supported by the Hagibis device.
 If the pipeline drops frames, lower the resolution or frame rate.
@@ -423,21 +574,57 @@ If the pipeline drops frames, lower the resolution or frame rate.
 ### What this project is
 
 A PyQt6 GUI monitor for USB capture cards on a Linux desktop. Not a recording
-tool — purely live monitoring, image control, and optional audio passthrough.
+tool — purely live monitoring, image control, optional audio passthrough,
+virtual camera output (v4l2loopback), and virtual microphone (PulseAudio).
 All settings are organised into named profiles.
 
 ### Architecture
 
-```
-MainWindow
-  ├── VideoWorker (QThread) → ffmpeg -f v4l2 → raw RGB24 → QImage → VideoDisplay
-  ├── AudioWorker (QThread) → ffmpeg -f alsa → s16le PCM → numpy RMS → VU meters
-  │                                         └→ (passthrough) pulse sink
-  └── pactl subprocess  ← real-time volume on AudioWorker's sink input
+```mermaid
+flowchart LR
+    CAP["/dev/video0\nCapture Card"]
+    ALSA["ALSA\nplughw:Hagibis,0"]
+
+    subgraph VW["VideoWorker (QThread)"]
+        FFMPEG_V["ffmpeg\n-f v4l2 → rgb24"]
+    end
+
+    subgraph AW["AudioWorker (QThread)"]
+        FFMPEG_A["ffmpeg\n-f alsa → s16le"]
+    end
+
+    subgraph OW["OutputWorker (QThread)"]
+        FFMPEG_O["ffmpeg\n-f rawvideo → v4l2"]
+    end
+
+    VD["VideoDisplay\n(preview)"]
+    VU["VU Meters"]
+
+    PACAT["pacat"]
+    BUS["hagibis_bus\nnull-sink"]
+    VIRT["hagibis_virtual\nremap-source"]
+    PULSE["System Speakers\ndefault sink"]
+    LOOP["/dev/videoN\nv4l2loopback"]
+
+    OBS_CAM["OBS / Camera readers"]
+    OBS_MIC["OBS / Mic readers"]
+    MW["MainWindow"]
+
+    CAP --> FFMPEG_V -->|"frame_ready signal"| VD
+    VD -->|"push_frame"| FFMPEG_O --> LOOP --> OBS_CAM
+
+    ALSA --> FFMPEG_A
+    FFMPEG_A -->|"s16le stdout"| VU
+    FFMPEG_A -->|"passthrough"| PULSE
+    FFMPEG_A -->|"pipe"| PACAT --> BUS
+    BUS -->|"monitor"| VIRT --> OBS_MIC
+
+    MW -.->|"pactl set-sink-input-volume"| PULSE
+    MW -.->|"pactl set-sink-volume"| BUS
 ```
 
-Two long-lived ffmpeg subprocesses; one per worker. Workers communicate back
-to the main thread exclusively via Qt signals.
+Three long-lived ffmpeg subprocesses (video, audio, output); one per worker.
+Workers communicate back to the main thread exclusively via Qt signals.
 
 ### Settings / profile system
 
@@ -452,12 +639,41 @@ settings = _load_from_disk(name)       # INI file → struct
 ```
 
 Profile INI files live in `~/.config/HagibisMonitor/profiles/`. The main
-`HagibisMonitor.ini` stores only `window/geometry`, `window/state`, and
-`profile/current`. **Never write profile data to the global QSettings** —
-it breaks the profile separation.
+`HagibisMonitor.ini` stores window geometry and output settings (device,
+resolution, pixel format, fps). **Never write profile data to the global
+QSettings** — it breaks the profile separation.
 
-The `_load_from_disk()` function supports the old per-device-keyed format
-(`cap/{dev_key}/fmt`) as a migration fallback.
+Output is always loaded with `enabled=False` regardless of the saved value.
+
+### AppSettings fields (current)
+
+```python
+@dataclass
+class AppSettings:
+    scale_mode: str = "fit"
+    crop_mode: str = "full"
+    bg_color: str = "#1f1f1f"
+    video_device: str = "/dev/video0"
+    video_fmt: str = "mjpeg"
+    video_res: str = "1280x720"
+    video_fps: int = 30
+    brightness: int = 50
+    contrast: int = 50
+    saturation: int = 50
+    hue: int = 50
+    audio_device: str = "plughw:Hagibis,0"
+    audio_enabled: bool = True
+    mono_mix: bool = False
+    passthrough: bool = False
+    volume_db: int = 0
+    volume_l_db: int = 0
+    volume_r_db: int = 0
+    output_scale_mode: str = "fit"
+    output_crop_mode: str = "full"
+    pan_x: float = 0.0
+    pan_y: float = 0.0
+    zoom: float = 1.0
+```
 
 ### Key design decisions
 
@@ -465,11 +681,22 @@ The `_load_from_disk()` function supports the old per-device-keyed format
   YUYV without extra libraries.
 - **ffmpeg, not sounddevice/pyaudio** — ffmpeg reads ALSA directly and outputs
   raw s16le PCM for numpy.
-- **`asplit` for VU + passthrough** — avoids opening the ALSA device twice.
+- **`asplit` for VU + passthrough + virtual** — avoids opening the ALSA device
+  multiple times.
 - **`plughw:Name,N` not `hw:N,N`** — name-based, survives USB re-enumeration;
   `plughw` allows format conversion via ALSA's plugin layer.
-- **pactl for real-time speaker volume** — ffmpeg's filter graph is static;
-  `pactl set-sink-input-volume` adjusts the stream volume without restarting.
+- **pacat for virtual mic** — more reliable than ffmpeg writing directly to
+  a named PulseAudio sink.
+- **PA modules are persistent** — `hagibis_bus` and `hagibis_virtual` are never
+  unloaded by `AudioWorker.run()`. `_find_existing_modules()` reuses them on
+  restart. `teardown()` is called explicitly only on output-disable or close.
+  This prevents OBS from losing its microphone device on volume/mono changes.
+- **`pactl set-sink-volume hagibis_bus`** — more reliable than
+  `set-source-volume hagibis_virtual` in PipeWire's PulseAudio compat layer.
+  Targeting the null-sink directly ensures the monitor output (and thus the
+  virtual source) carries the correct volume.
+- **`pactl set-sink-input-volume` for passthrough** — same approach, but
+  targeting the ffmpeg sink input found by PID polling.
 - **Python-side gain for VU** — `AudioWorker` multiplies raw PCM by the linear
   gain each chunk, so VU meters respond instantly while dragging sliders.
 - **`v4l2-ctl` subprocess for image controls** — fire-and-forget `Popen`;
@@ -483,6 +710,12 @@ The `_load_from_disk()` function supports the old per-device-keyed format
 - **In-memory dirty tracking** — changes update `self._dirty` but do not write
   to disk. Explicit Save / close-event saves flush to disk. This prevents
   accidental profile corruption while experimenting.
+- **v4l2loopback without `exclusive_caps`** — loaded without `exclusive_caps=1`
+  so OBS and other readers see all standard V4L2 resolutions in their device
+  settings, not just the one currently being written.
+- **150 ms gap on output resolution change** — `_restart_output()` stops the
+  OutputWorker, waits 150 ms (for OBS to process `V4L2_EVENT_SOURCE_CHANGE`),
+  then starts a new worker at the new resolution.
 
 ### Things not yet implemented
 
@@ -499,6 +732,8 @@ AppSettings.video_device  = "/dev/video0"
 AppSettings.audio_device  = "plughw:Hagibis,0"
 AudioWorker.SAMPLE_RATE   = 48000
 AudioWorker.CHUNK_FRAMES  = 1024
+AudioWorker.BUS_SINK      = "hagibis_bus"
+AudioWorker.SOURCE_NAME   = "hagibis_virtual"
 ```
 
 ### How to restart streams from code
@@ -506,6 +741,7 @@ AudioWorker.CHUNK_FRAMES  = 1024
 ```python
 win._restart_video()   # stops VideoWorker, starts fresh with current cap_params()
 win._start_audio()     # stops AudioWorker, starts fresh with current UI state
+win._restart_output()  # stops OutputWorker, waits 150 ms, starts fresh
 win._apply_v4l2_all()  # re-applies all image control sliders to hardware
 ```
 
