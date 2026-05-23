@@ -1,0 +1,92 @@
+name: Build & Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version — omit the "v" prefix (e.g. 1.2.0). Check the previous tag shown in the first step if unsure.'
+        required: true
+        default: '1.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Restrict to authorized user
+        if: github.actor != 'retrozelda'
+        run: |
+          echo "Only retrozelda can trigger this workflow. Actor was: ${{ github.actor }}"
+          exit 1
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Show last release tag
+        run: |
+          LAST=$(git tag --sort=-version:refname | grep -E '^v[0-9]' | head -1 || true)
+          if [ -z "$LAST" ]; then
+            echo "No previous release tags found."
+          else
+            echo "Last release tag: $LAST"
+          fi
+
+      - name: Resolve version
+        id: ver
+        run: |
+          RAW="${{ github.event.inputs.version }}"
+          RAW="${RAW#v}"   # strip leading v if user included it
+          echo "tag=v${RAW}" >> "$GITHUB_OUTPUT"
+
+      - name: Create and push tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "${{ steps.ver.outputs.tag }}"
+          git push origin "${{ steps.ver.outputs.tag }}"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y \
+            libegl1 \
+            libxcb-cursor0 \
+            libxcb-icccm4 \
+            libxcb-image0 \
+            libxcb-keysyms1 \
+            libxcb-randr0 \
+            libxcb-render-util0 \
+            libxcb-xinerama0 \
+            libxcb-xkb1 \
+            libxkbcommon-x11-0 \
+            upx-ucl
+
+      - name: Install Python dependencies
+        run: pip install pyinstaller PyQt6 numpy
+
+      - name: Build
+        run: python -m PyInstaller hagibis-monitor.spec --clean --noconfirm
+
+      - name: Package
+        run: |
+          TAG="${{ steps.ver.outputs.tag }}"
+          ARCHIVE="hagibis-monitor-${TAG}-linux-x86_64.tar.gz"
+          mkdir staging
+          cp dist/hagibis-monitor hagibis-monitor.desktop install.sh staging/
+          tar -czf "$ARCHIVE" -C staging .
+          echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          files: ${{ env.ARCHIVE }}
+          generate_release_notes: true
