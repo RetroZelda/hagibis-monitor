@@ -410,11 +410,6 @@ class AudioWorker(QThread):
 
         mono_filter = "pan=stereo|c0=0.5*c0+0.5*c1|c1=0.5*c0+0.5*c1" if self.mono_mix else ""
 
-        master_lin = 10.0 ** (self.volume_db   / 20.0)
-        l_lin      = 10.0 ** (self.volume_l_db / 20.0)
-        r_lin      = 10.0 ** (self.volume_r_db / 20.0)
-        vol_filter = f"pan=stereo|c0={master_lin * l_lin:.6f}*c0|c1={master_lin * r_lin:.6f}*c1"
-
         if not self.passthrough and not self.virtual_output:
             cmd = base[:]
             if mono_filter:
@@ -426,13 +421,11 @@ class AudioWorker(QThread):
         if self.passthrough:
             split_labels.append("[pt]")
         if self.virtual_output:
-            split_labels.append("[virt_raw]")
+            split_labels.append("[virt]")
 
         n    = len(split_labels)
         mono = mono_filter + "," if mono_filter else ""
         fc   = f"[0:a]{mono}asplit={n}{''.join(split_labels)}"
-        if self.virtual_output:
-            fc += f";[virt_raw]{vol_filter}[virt]"
 
         cmd = base + ["-filter_complex", fc]
         cmd += ["-map", "[vu]", "-f", "s16le", "-ar", str(self.SAMPLE_RATE), "-ac", "2", "pipe:1"]

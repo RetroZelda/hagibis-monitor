@@ -970,9 +970,6 @@ class MainWindow(QMainWindow):
         self._vol_slider.valueChanged.connect(self._on_vol_changed)
         self._vol_l_slider.valueChanged.connect(self._on_vol_l_changed)
         self._vol_r_slider.valueChanged.connect(self._on_vol_r_changed)
-        self._vol_slider.sliderReleased.connect(self._on_audio_opt_change)
-        self._vol_l_slider.sliderReleased.connect(self._on_audio_opt_change)
-        self._vol_r_slider.sliderReleased.connect(self._on_audio_opt_change)
         layout.addWidget(vol_grp)
 
         layout.addStretch()
@@ -1816,6 +1813,8 @@ class MainWindow(QMainWindow):
         self._pa_sink_input = None
         self._pa_poll_count = 0
         QTimer.singleShot(80, self._poll_pa_sink_input)
+        if wk.virtual_output:
+            QTimer.singleShot(500, self._apply_virtual_source_volume)
         self._update_output_status()
 
     def _stop_audio(self, teardown_virtual: bool = False):
@@ -2075,6 +2074,7 @@ class MainWindow(QMainWindow):
         if self._audio_worker:
             self._audio_worker.volume_db = v
         self._apply_pa_volume()
+        self._apply_virtual_source_volume()
         self._mark_dirty()
 
     def _on_vol_l_changed(self, v: int):
@@ -2082,6 +2082,7 @@ class MainWindow(QMainWindow):
         if self._audio_worker:
             self._audio_worker.volume_l_db = v
         self._apply_pa_volume()
+        self._apply_virtual_source_volume()
         self._mark_dirty()
 
     def _on_vol_r_changed(self, v: int):
@@ -2089,6 +2090,7 @@ class MainWindow(QMainWindow):
         if self._audio_worker:
             self._audio_worker.volume_r_db = v
         self._apply_pa_volume()
+        self._apply_virtual_source_volume()
         self._mark_dirty()
 
     # ── pactl real-time speaker volume ────────────────────────────────────────
@@ -2133,6 +2135,18 @@ class MainWindow(QMainWindow):
         r_pct = max(0, int(100 * 10 ** ((master + self._vol_r_slider.value()) / 20.0)))
         subprocess.Popen(
             ["pactl", "set-sink-input-volume", str(self._pa_sink_input),
+             f"{l_pct}%", f"{r_pct}%"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
+    def _apply_virtual_source_volume(self):
+        if not self._out_enabled.isChecked():
+            return
+        master = self._vol_slider.value()
+        l_pct = max(0, int(100 * 10 ** ((master + self._vol_l_slider.value()) / 20.0)))
+        r_pct = max(0, int(100 * 10 ** ((master + self._vol_r_slider.value()) / 20.0)))
+        subprocess.Popen(
+            ["pactl", "set-sink-volume", AudioWorker.BUS_SINK,
              f"{l_pct}%", f"{r_pct}%"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
