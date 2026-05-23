@@ -24,7 +24,12 @@ V4L2-compatible capture device.
 9. [Audio](#audio)
 10. [Output (virtual camera + virtual mic)](#output-virtual-camera--virtual-mic)
 11. [Known quirks and gotchas](#known-quirks-and-gotchas)
-12. [AI context — read this if you are a future assistant](#ai-context--read-this-if-you-are-a-future-assistant)
+12. [For AI agents](#for-ai-agents)
+
+> **AI / coding agents:** before doing any work in this repo, read both
+> this README and [AGENTS.md](AGENTS.md). AGENTS.md contains the rules
+> you are expected to follow (versioning, diagrams, doc hygiene) and the
+> deeper architectural context that humans don't usually need to re-read.
 
 ---
 
@@ -302,14 +307,81 @@ sudo apt install v4l2loopback-dkms
 
 ## Running the app
 
+There are three ways to run the app, in increasing order of formality:
+
+### 1. From source (development)
+
 ```bash
 cd ~/Development/projects/hagibis-monitor
 python3 main.py
 ```
 
-Or press **F5** in VS Code (uses `.vscode/launch.json`).
+Or press **F5** in VS Code (uses `.vscode/launch.json`). Requires the
+Python deps from the [Dependencies](#dependencies) section installed on
+your system (or in a venv) — there is no install step for this path.
 
-There is no install step.
+### 2. Build a standalone binary — [`build.sh`](build.sh)
+
+```bash
+./build.sh
+```
+
+What it does:
+- Creates (or reuses) an isolated build venv at `.venv-build/`.
+- Installs `pyinstaller`, `PyQt6`, and `numpy` into that venv only — your
+  system Python is not touched.
+- Runs `pyinstaller hagibis-monitor.spec --clean --noconfirm`, producing
+  a single-file executable at **`dist/hagibis-monitor`**.
+
+The resulting binary bundles Python, PyQt6, and numpy, so it runs on any
+glibc-compatible Linux without a Python install. It still needs the
+runtime system tools (`ffmpeg`, `v4l2-ctl`, `pactl`, `pacat`, etc. — see
+[Dependencies](#dependencies)).
+
+Run it directly without installing:
+
+```bash
+./dist/hagibis-monitor
+```
+
+### 3. Install system-wide or per-user — [`install.sh`](install.sh)
+
+After `./build.sh` has produced `dist/hagibis-monitor`:
+
+```bash
+./install.sh              # per-user (default): installs into ~/.local
+./install.sh --system     # system-wide: installs into /usr/local (asks for sudo)
+```
+
+What it installs:
+
+| Scope | Binary | Desktop entry |
+|---|---|---|
+| Per-user (default) | `~/.local/bin/hagibis-monitor` | `~/.local/share/applications/hagibis-monitor.desktop` |
+| `--system` | `/usr/local/bin/hagibis-monitor` | `/usr/local/share/applications/hagibis-monitor.desktop` |
+
+The desktop entry's `Exec=` line is rewritten to the absolute install
+path, and `update-desktop-database` is run if available so the app shows
+up in your application menu under **AudioVideo → Hagibis Monitor**
+immediately (no re-login needed on most desktops).
+
+If `~/.local/bin` is not on your `PATH`, the installer reminds you to add it:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+### 4. Pre-built release tarball
+
+If you'd rather not build locally, every push that bumps the version in
+[`.github/workflows/release.yml`](.github/workflows/release.yml) (and
+every manual workflow run) publishes a `hagibis-monitor-vX.Y.Z-linux-x86_64.tar.gz`
+to the project's GitHub Releases page. Extract it and run `./install.sh`
+from inside the extracted directory — same options as above.
+
+> **Note:** `hagibis-monitor.sh` in the repo root is **not** the app —
+> it's the original GStreamer one-liner that predated this project, kept
+> only for reference. Don't use it.
 
 ---
 
@@ -638,274 +710,24 @@ If the pipeline drops frames, lower the resolution or frame rate.
 
 ---
 
-## AI context — read this if you are a future assistant
+## For AI agents
 
-> This section gives you the full picture so you can contribute without
-> re-reading the whole conversation.
+If you are an AI coding agent (Claude Code, Cursor, Codex, Aider, Copilot
+agents, etc.), the rules and architectural context you need to do work in
+this repo live in **[AGENTS.md](AGENTS.md)**. That file covers:
 
-### Keep this README up to date
+- The expectation that you read this README first.
+- How and when to bump the version in
+  [`.github/workflows/release.yml`](.github/workflows/release.yml) (semver
+  rules, the "inherit pending bumps" rule, push-trigger interaction).
+- The requirement to keep this README — and AGENTS.md — up to date in the
+  same commit as any change that makes either of them stale.
+- The requirement to use Mermaid (never ASCII boxes or external images)
+  for any diagram.
+- The full module dependency graph, runtime architecture graph, profile
+  system, `AppSettings` field list, design-decision log, and "how to do X
+  from code" snippets.
 
-**This README is the canonical context document for the project.** Whenever
-you change something that affects how a future assistant should reason about
-the code, update the README in the same change. That includes:
+Humans can skip AGENTS.md; the sections above this one cover everything
+needed to install, run, and use the app.
 
-- File splits, renames, or new modules → update [Project layout](#project-layout)
-  and the per-file sub-sections.
-- New `AppSettings` / `OutputSettings` fields → update the [AppSettings fields](#appsettings-fields-current)
-  block and the [Profiles](#profiles) "what each profile stores" table.
-- New ffmpeg / pactl invocations or worker threads → update
-  [Architecture](#architecture) and the relevant worker description.
-- New UI tabs, controls, or status indicators → update the
-  [UI walkthrough](#ui-walkthrough) and [What the app does](#what-the-app-does).
-- New external dependencies → update the [Dependencies](#dependencies) table.
-- New design decisions or non-obvious quirks → update [Key design decisions](#key-design-decisions)
-  or [Known quirks and gotchas](#known-quirks-and-gotchas).
-
-If a change makes any part of the README stale, fix it in the same commit —
-do not leave it for "later." A stale README is worse than a missing one
-because future assistants will trust it.
-
-**Always use Mermaid for diagrams.** Any flow, dependency, state machine,
-sequence, or architecture diagram added to this README — or to any other
-markdown doc in the repo — must be a fenced ```mermaid``` block, never an
-ASCII-art box drawing, never an embedded image, and never a link to an
-external diagramming tool. Mermaid renders natively on GitHub, stays
-diffable in PRs, and can be updated in-place when the underlying code
-changes. Examples already in this file: the [Architecture](#architecture)
-runtime graph and the [Module dependency graph](#module-dependency-graph).
-
-### What this project is
-
-A PyQt6 GUI monitor for USB capture cards on a Linux desktop. Not a recording
-tool — purely live monitoring, image control, optional audio passthrough,
-virtual camera output (v4l2loopback), and virtual microphone (PulseAudio).
-All settings are organised into named profiles.
-
-### Code organisation
-
-The codebase is split by functional area (see [Project layout](#project-layout)
-for the full file tree):
-
-| File | Role |
-|---|---|
-| `main.py` | Entry point only — `QApplication` + `MainWindow` |
-| `ui.py` | `MainWindow` (everything UI-side) + `_StatusBar` |
-| `video.py` | `VideoDisplay` widget + V4L2 device scanning / cap query |
-| `audio.py` | PulseAudio / ALSA device scanning |
-| `output.py` | v4l2loopback discovery / load / unload + `_ModprobeWorker` |
-| `settings.py` | `AppSettings` + `OutputSettings` dataclasses + constant tables |
-| `utils.py` | Small shared helpers (`_dev_key`, `_aspect_label`, `_sbin`, `_slider_row`, `_db_label`) |
-| `workers.py` | `VideoWorker`, `AudioWorker`, `OutputWorker` — all three `QThread` subprocess drivers |
-| `vu_meter.py` | `VuMeter`, `DbScale`, `StereoVuMeter` |
-
-`MainWindow` in `ui.py` is intentionally monolithic — it owns every widget
-and every worker, and orchestrates profile load/save, stream restarts,
-real-time volume application, and the dirty-state dialog. Splitting it
-further would require restructuring methods into mixins or per-tab
-controllers, which would be a behavioural change rather than reorganisation.
-
-#### Module dependency graph
-
-```mermaid
-flowchart TD
-    main[main.py<br/>entry point]
-    ui[ui.py<br/>MainWindow + _StatusBar]
-    video[video.py<br/>VideoDisplay + v4l2-ctl scan]
-    audio[audio.py<br/>pactl / arecord scan]
-    output[output.py<br/>v4l2loopback + _ModprobeWorker]
-    workers[workers.py<br/>VideoWorker / AudioWorker / OutputWorker]
-    vu[vu_meter.py<br/>VuMeter / DbScale / StereoVuMeter]
-    settings[settings.py<br/>AppSettings / OutputSettings + const tables]
-    utils[utils.py<br/>_dev_key / _aspect_label / _sbin / _slider_row / _db_label]
-
-    main --> ui
-    ui --> video
-    ui --> audio
-    ui --> output
-    ui --> workers
-    ui --> vu
-    ui --> settings
-    ui --> utils
-    output --> utils
-```
-
-Notes:
-- `workers.py`, `vu_meter.py`, `video.py`, `audio.py`, and `settings.py` have
-  no project-local imports — they only depend on PyQt6, numpy, and stdlib.
-- Only `ui.py` reaches across modules to wire things together; nothing
-  outside `ui.py` depends on `MainWindow`.
-
-### Architecture
-
-```mermaid
-flowchart LR
-    CAP["/dev/video0\nCapture Card"]
-    ALSA["ALSA\nplughw:Hagibis,0"]
-
-    subgraph VW["VideoWorker (QThread)"]
-        FFMPEG_V["ffmpeg\n-f v4l2 → rgb24"]
-    end
-
-    subgraph AW["AudioWorker (QThread)"]
-        FFMPEG_A["ffmpeg\n-f alsa → s16le"]
-    end
-
-    subgraph OW["OutputWorker (QThread)"]
-        FFMPEG_O["ffmpeg\n-f rawvideo → v4l2"]
-    end
-
-    VD["VideoDisplay\n(preview)"]
-    VU["VU Meters"]
-
-    PACAT["pacat"]
-    BUS["hagibis_bus\nnull-sink"]
-    VIRT["hagibis_virtual\nremap-source"]
-    PULSE["System Speakers\ndefault sink"]
-    LOOP["/dev/videoN\nv4l2loopback"]
-
-    OBS_CAM["OBS / Camera readers"]
-    OBS_MIC["OBS / Mic readers"]
-    MW["MainWindow"]
-
-    CAP --> FFMPEG_V -->|"frame_ready signal"| VD
-    VD -->|"push_frame"| FFMPEG_O --> LOOP --> OBS_CAM
-
-    ALSA --> FFMPEG_A
-    FFMPEG_A -->|"s16le stdout"| VU
-    FFMPEG_A -->|"passthrough"| PULSE
-    FFMPEG_A -->|"pipe"| PACAT --> BUS
-    BUS -->|"monitor"| VIRT --> OBS_MIC
-
-    MW -.->|"pactl set-sink-input-volume"| PULSE
-    MW -.->|"pactl set-sink-volume"| BUS
-```
-
-Three long-lived ffmpeg subprocesses (video, audio, output); one per worker.
-Workers communicate back to the main thread exclusively via Qt signals.
-
-### Settings / profile system
-
-All profile-able state lives in the `AppSettings` dataclass (flat, no nesting).
-The three canonical operations are:
-
-```python
-settings = _collect_settings()         # UI → struct
-_apply_settings(settings)              # struct → UI + restart streams
-_save_to_disk(settings, profile_name)  # struct → INI file (single QSettings obj)
-settings = _load_from_disk(name)       # INI file → struct
-```
-
-Profile INI files live in `~/.config/HagibisMonitor/profiles/`. The main
-`HagibisMonitor.ini` stores window geometry and output settings (device,
-resolution, pixel format, fps). **Never write profile data to the global
-QSettings** — it breaks the profile separation.
-
-Output is always loaded with `enabled=False` regardless of the saved value.
-
-### AppSettings fields (current)
-
-```python
-@dataclass
-class AppSettings:
-    scale_mode: str = "fit"
-    crop_mode: str = "full"
-    bg_color: str = "#1f1f1f"
-    video_device: str = "/dev/video0"
-    video_fmt: str = "mjpeg"
-    video_res: str = "1280x720"
-    video_fps: int = 30
-    brightness: int = 50
-    contrast: int = 50
-    saturation: int = 50
-    hue: int = 50
-    audio_device: str = "plughw:Hagibis,0"
-    audio_enabled: bool = True
-    mono_mix: bool = False
-    passthrough: bool = False
-    volume_db: int = 0
-    volume_l_db: int = 0
-    volume_r_db: int = 0
-    output_scale_mode: str = "fit"
-    output_crop_mode: str = "full"
-    pan_x: float = 0.0
-    pan_y: float = 0.0
-    zoom: float = 1.0
-```
-
-### Key design decisions
-
-- **ffmpeg, not OpenCV** — OpenCV was not installed; ffmpeg handles MJPEG and
-  YUYV without extra libraries.
-- **ffmpeg, not sounddevice/pyaudio** — ffmpeg reads ALSA directly and outputs
-  raw s16le PCM for numpy.
-- **`asplit` for VU + passthrough + virtual** — avoids opening the ALSA device
-  multiple times.
-- **`plughw:Name,N` not `hw:N,N`** — name-based, survives USB re-enumeration;
-  `plughw` allows format conversion via ALSA's plugin layer.
-- **pacat for virtual mic** — more reliable than ffmpeg writing directly to
-  a named PulseAudio sink.
-- **PA modules are persistent** — `hagibis_bus` and `hagibis_virtual` are never
-  unloaded by `AudioWorker.run()`. `_find_existing_modules()` reuses them on
-  restart. `teardown()` is called explicitly only on output-disable or close.
-  This prevents OBS from losing its microphone device on volume/mono changes.
-- **`pactl set-sink-volume hagibis_bus`** — more reliable than
-  `set-source-volume hagibis_virtual` in PipeWire's PulseAudio compat layer.
-  Targeting the null-sink directly ensures the monitor output (and thus the
-  virtual source) carries the correct volume.
-- **`pactl set-sink-input-volume` for passthrough** — same approach, but
-  targeting the ffmpeg sink input found by PID polling.
-- **Python-side gain for VU** — `AudioWorker` multiplies raw PCM by the linear
-  gain each chunk, so VU meters respond instantly while dragging sliders.
-- **`v4l2-ctl` subprocess for image controls** — fire-and-forget `Popen`;
-  all values re-applied via `_apply_v4l2_all()` on profile load.
-- **`paintEvent` rendering in `VideoDisplay`** — `setPixmap` can only fill
-  the full label bounds; using `QPainter.drawPixmap` at a computed `QPoint`
-  allows area-constrained scale modes with background colour filling the rest.
-- **Single QSettings object per save** — previously, calling helper functions
-  that each created their own QSettings object caused sync() to overwrite
-  each other. All writes now go through one object before sync().
-- **In-memory dirty tracking** — changes update `self._dirty` but do not write
-  to disk. Explicit Save / close-event saves flush to disk. This prevents
-  accidental profile corruption while experimenting.
-- **v4l2loopback without `exclusive_caps`** — loaded without `exclusive_caps=1`
-  so OBS and other readers see all standard V4L2 resolutions in their device
-  settings, not just the one currently being written.
-- **150 ms gap on output resolution change** — `_restart_output()` stops the
-  OutputWorker, waits 150 ms (for OBS to process `V4L2_EVENT_SOURCE_CHANGE`),
-  then starts a new worker at the new resolution.
-
-### Things not yet implemented
-
-- Auto-detecting the PulseAudio source name for audio passthrough (currently
-  uses `plughw:` ALSA direct; switch to a PipeWire virtual device if blocked).
-- Recording / snapshot functionality.
-- Detection of whether the capture card is actually sending a valid signal.
-- Appearance/theming tab.
-
-### Hardware constants (defaults, all overridable via UI)
-
-```python
-AppSettings.video_device  = "/dev/video0"
-AppSettings.audio_device  = "plughw:Hagibis,0"
-AudioWorker.SAMPLE_RATE   = 48000
-AudioWorker.CHUNK_FRAMES  = 1024
-AudioWorker.BUS_SINK      = "hagibis_bus"
-AudioWorker.SOURCE_NAME   = "hagibis_virtual"
-```
-
-### How to restart streams from code
-
-```python
-win._restart_video()   # stops VideoWorker, starts fresh with current cap_params()
-win._start_audio()     # stops AudioWorker, starts fresh with current UI state
-win._restart_output()  # stops OutputWorker, waits 150 ms, starts fresh
-win._apply_v4l2_all()  # re-applies all image control sliders to hardware
-```
-
-### How to load / save a profile from code
-
-```python
-s = win._load_from_disk("GBC")   # read GBC.ini → AppSettings
-win._apply_settings(s)           # apply to UI + restart streams
-win._save_to_disk(win._collect_settings(), "GBC")  # write current UI → GBC.ini
-```

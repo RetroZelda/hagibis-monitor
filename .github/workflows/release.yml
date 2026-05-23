@@ -6,7 +6,10 @@ on:
       version:
         description: 'Release version — omit the "v" prefix (e.g. 1.2.0). Check the previous tag shown in the first step if unsure. Version numbering should be "{major}.{minor}.{patch}" and follow semver principles. This will be used as the release tag and in the archive name, so choose carefully and sequentially!'
         required: true
-        default: '1.1.1'
+        default: '1.1.2'
+  push:
+    branches:
+      - main
 
 permissions:
   contents: write
@@ -38,11 +41,34 @@ jobs:
       - name: Resolve version
         id: ver
         run: |
-          RAW="${{ github.event.inputs.version }}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            RAW="${{ github.event.inputs.version }}"
+          else
+            # Push trigger: read the version from the default: line in this file.
+            # Keeps a single source of truth — bumping the default in a commit
+            # is what cuts a release on push.
+            RAW=$(grep -oP "default:\s*'\K[0-9]+\.[0-9]+\.[0-9]+" .github/workflows/release.yml | head -1)
+            if [ -z "$RAW" ]; then
+              echo "Could not parse version from release.yml default — aborting."
+              exit 1
+            fi
+          fi
           RAW="${RAW#v}"   # strip leading v if user included it
-          echo "tag=v${RAW}" >> "$GITHUB_OUTPUT"
+          TAG="v${RAW}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Resolved release tag: ${TAG}"
+
+          # Skip if this tag already exists — avoids re-releasing on every
+          # push that didn't bump the version (e.g. README-only commits).
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "Tag ${TAG} already exists on origin — nothing to release."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Create and push tag
+        if: steps.ver.outputs.skip != 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -50,10 +76,12 @@ jobs:
           git push origin "${{ steps.ver.outputs.tag }}"
 
       - uses: actions/setup-python@v5
+        if: steps.ver.outputs.skip != 'true'
         with:
           python-version: '3.11'
 
       - name: Install system dependencies
+        if: steps.ver.outputs.skip != 'true'
         run: |
           sudo apt-get update -q
           sudo apt-get install -y \
@@ -70,12 +98,15 @@ jobs:
             upx-ucl
 
       - name: Install Python dependencies
+        if: steps.ver.outputs.skip != 'true'
         run: pip install pyinstaller PyQt6 numpy
 
       - name: Build
+        if: steps.ver.outputs.skip != 'true'
         run: python -m PyInstaller hagibis-monitor.spec --clean --noconfirm
 
       - name: Package
+        if: steps.ver.outputs.skip != 'true'
         run: |
           TAG="${{ steps.ver.outputs.tag }}"
           ARCHIVE="hagibis-monitor-${TAG}-linux-x86_64.tar.gz"
@@ -85,6 +116,7 @@ jobs:
           echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
 
       - name: Create release
+        if: steps.ver.outputs.skip != 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
