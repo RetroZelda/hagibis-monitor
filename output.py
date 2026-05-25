@@ -40,17 +40,45 @@ def _v4l2loopback_installed() -> bool:
     return Path("/sys/module/v4l2loopback").exists()
 
 
+def _hagibis_exclusive_caps_ok() -> bool:
+    """Return True if the HagibisMonitor device (video_nr=10) has exclusive_caps=1."""
+    try:
+        nr_list = Path("/sys/module/v4l2loopback/parameters/video_nr").read_text().strip().split(",")
+        ex_list = Path("/sys/module/v4l2loopback/parameters/exclusive_caps").read_text().strip().split(",")
+        for i, nr in enumerate(nr_list):
+            if nr.strip() == "10" and i < len(ex_list):
+                return ex_list[i].strip().upper() in ("Y", "1", "TRUE")
+    except OSError:
+        pass
+    return False
+
+
 def _load_v4l2loopback() -> tuple[str, bool]:
     """Return (device_path, loaded_by_us). Empty string on failure."""
+    modprobe = _sbin("modprobe")
     existing = _find_loopback_devices()
     if existing:
-        return existing[0], False
-    modprobe = _sbin("modprobe")
+        if _hagibis_exclusive_caps_ok():
+            return existing[0], False
+        # Device exists but without exclusive_caps=1; unload and reload.
+        unloaded = False
+        for prefix in ([], ["pkexec"]):
+            try:
+                if subprocess.run(prefix + [modprobe, "-r", "v4l2loopback"],
+                                  capture_output=True, timeout=10).returncode == 0:
+                    unloaded = True
+                    break
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                continue
+        if not unloaded:
+            return existing[0], False  # device in use or no perms; use as-is
+        time.sleep(0.2)
     for prefix in ([], ["pkexec"]):
         cmd = prefix + [
             modprobe, "v4l2loopback",
             "devices=1", "video_nr=10",
             "card_label=HagibisMonitor",
+            "exclusive_caps=1",
         ]
         try:
             r = subprocess.run(cmd, capture_output=True, timeout=15)
@@ -63,9 +91,11 @@ def _load_v4l2loopback() -> tuple[str, bool]:
     return "", False
 
 
-def _unload_v4l2loopback():
+def _unload_v4l2loopback(silent: bool = False):
+    """Unload the v4l2loopback module. If silent=True, skip pkexec (no UI prompts)."""
     modprobe = _sbin("modprobe")
-    for prefix in ([], ["pkexec"]):
+    prefixes: tuple = ([],) if silent else ([], ["pkexec"])
+    for prefix in prefixes:
         cmd = prefix + [modprobe, "-r", "v4l2loopback"]
         try:
             if subprocess.run(cmd, capture_output=True, timeout=10).returncode == 0:

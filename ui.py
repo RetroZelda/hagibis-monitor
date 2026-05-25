@@ -17,6 +17,7 @@ from video import VideoDisplay, _scan_video_devices, _query_device_caps
 from audio import _scan_audio_devices
 from output import (
     _find_loopback_devices, _v4l2loopback_installed, _ModprobeWorker,
+    _unload_v4l2loopback,
 )
 from settings import (
     AppSettings, OutputSettings,
@@ -95,6 +96,7 @@ class MainWindow(QMainWindow):
         self._output_worker:   OutputWorker   | None = None
         self._modprobe_worker: _ModprobeWorker | None = None
         self._v4l2_device:       str  = ""
+        self._v4l2_loaded_by_us: bool = False
         self._caps:           dict = {}
         self._pa_sink_input:  int | None = None
         self._pa_poll_count:  int = 0
@@ -1338,6 +1340,9 @@ class MainWindow(QMainWindow):
                 worker.start()
         else:
             self._stop_output()
+            if self._v4l2_loaded_by_us:
+                _unload_v4l2loopback()
+                self._v4l2_loaded_by_us = False
             self._v4l2_device = ""
             w, h = self._out_res_combo.currentData() or (1920, 1080)
             self._display.set_output_mode(False, w, h)
@@ -1350,6 +1355,7 @@ class MainWindow(QMainWindow):
     def _on_v4l2_loaded(self, dev: str, loaded_by_us: bool):
         if dev:
             self._v4l2_device = dev
+            self._v4l2_loaded_by_us = loaded_by_us
             self._populate_output_video_combo(dev)
             w, h = self._out_res_combo.currentData() or (1920, 1080)
             self._display.set_output_mode(True, w, h)
@@ -1428,7 +1434,7 @@ class MainWindow(QMainWindow):
             w, h = self._out_res_combo.currentData() or (1920, 1080)
             self._display.set_output_mode(True, w, h)
             self._stop_output()  # close device now → triggers SOURCE_CHANGE to readers
-            QTimer.singleShot(150, self._start_output)  # reopen after readers react
+            QTimer.singleShot(400, self._start_output)  # reopen after readers react
 
     def _feed_output(self, img: QImage):
         if self._output_worker is not None:
@@ -1601,6 +1607,9 @@ class MainWindow(QMainWindow):
         self._save_global()
         self._save_to_disk(self._collect_settings(), self._current_profile)
         self._stop_output()
+        if self._v4l2_loaded_by_us:
+            _unload_v4l2loopback(silent=True)  # no pkexec dialog on exit
+            self._v4l2_loaded_by_us = False
         self._stop_audio(teardown_virtual=True)
         self._stop_video()
         event.accept()
