@@ -337,12 +337,17 @@ class AppSettings:
 - **In-memory dirty tracking** — changes update `self._dirty` but do not write
   to disk. Explicit Save / close-event saves flush to disk. This prevents
   accidental profile corruption while experimenting.
-- **v4l2loopback without `exclusive_caps`** — loaded without `exclusive_caps=1`
-  so OBS and other readers see all standard V4L2 resolutions in their device
-  settings, not just the one currently being written.
-- **150 ms gap on output resolution change** — `_restart_output()` stops the
-  OutputWorker, waits 150 ms (for OBS to process `V4L2_EVENT_SOURCE_CHANGE`),
-  then starts a new worker at the new resolution.
+- **v4l2loopback with `exclusive_caps=1`** — loaded with `exclusive_caps=1` so
+  `V4L2_EVENT_SOURCE_CHANGE` fires reliably when the writer format changes.
+  OBS receives the event and re-negotiates the pipeline to match the new
+  resolution automatically. The module is unloaded on output-disable and on
+  app exit (silently, no pkexec prompt) so the device never carries a stale
+  format into the next session. If an existing device without `exclusive_caps=1`
+  is found at startup, it is unloaded and reloaded with the correct flag.
+- **400 ms gap on output resolution change** — `_restart_output()` stops the
+  OutputWorker, waits 400 ms (for OBS to fully process the SOURCE_CHANGE from
+  the writer closing before a new writer connects), then starts a new worker
+  at the new resolution.
 
 ## Things not yet implemented
 
@@ -368,7 +373,7 @@ AudioWorker.SOURCE_NAME   = "hagibis_virtual"
 ```python
 win._restart_video()   # stops VideoWorker, starts fresh with current cap_params()
 win._start_audio()     # stops AudioWorker, starts fresh with current UI state
-win._restart_output()  # stops OutputWorker, waits 150 ms, starts fresh
+win._restart_output()  # stops OutputWorker, waits 400 ms, starts fresh
 win._apply_v4l2_all()  # re-applies all image control sliders to hardware
 ```
 
