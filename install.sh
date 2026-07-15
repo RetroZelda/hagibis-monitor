@@ -3,11 +3,15 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-EXE="dist/hagibis-monitor"
 DESKTOP="hagibis-monitor.desktop"
 
+# Local build puts the binary in dist/; the release tarball puts it at the root.
+EXE="dist/hagibis-monitor"
+[[ -f "$EXE" ]] || EXE="./hagibis-monitor"
+
 if [[ ! -f "$EXE" ]]; then
-    echo "ERROR: $EXE not found. Run ./build.sh first."
+    echo "ERROR: hagibis-monitor binary not found (looked in dist/ and ./)."
+    echo "       Run ./build.sh first, or extract the release tarball here."
     exit 1
 fi
 
@@ -27,9 +31,13 @@ fi
 $SUDO mkdir -p "$BIN_DIR" "$APP_DIR"
 $SUDO install -m 755 "$EXE" "$BIN_DIR/hagibis-monitor"
 
-# Update Exec= path in the desktop file and install it
-sed "s|^Exec=.*|Exec=$BIN_DIR/hagibis-monitor|" "$DESKTOP" \
-    | $SUDO tee "$APP_DIR/hagibis-monitor.desktop" > /dev/null
+# Update Exec= path in the desktop file and install it. Build the Exec line
+# without sed (so a BIN_DIR with & or | can't corrupt the replacement) and
+# quote the path per the Desktop Entry spec so paths with spaces still launch.
+{
+    grep -v '^Exec=' "$DESKTOP"
+    printf 'Exec="%s/hagibis-monitor"\n' "$BIN_DIR"
+} | $SUDO tee "$APP_DIR/hagibis-monitor.desktop" > /dev/null
 $SUDO chmod 644 "$APP_DIR/hagibis-monitor.desktop"
 
 # Refresh application menu if possible

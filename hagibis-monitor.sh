@@ -39,8 +39,11 @@ VIDEO_DEVICE=$(detect_hagibis_video) || {
 }
 
 # --- Better audio source detection (MS2130 appears as USB Audio) ---
+# Exclude .monitor sources (an output sink's monitor would create a feedback
+# loop) and only match the capture card itself, not generic hdmi/capture names.
 AUDIO_SOURCE=$(pactl list short sources 2>/dev/null | \
-    grep -iE 'hagibis|macrosilicon|2130|usb.*audio|hdmi|capture' | \
+    grep -v '\.monitor' | \
+    grep -iE 'hagibis|macrosilicon|2130' | \
     head -n1 | awk '{print $2}' || true)
 
 # If nothing was found, you can still force the default source (or leave empty)

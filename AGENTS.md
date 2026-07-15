@@ -331,12 +331,31 @@ class AppSettings:
 - **`paintEvent` rendering in `VideoDisplay`** — `setPixmap` can only fill
   the full label bounds; using `QPainter.drawPixmap` at a computed `QPoint`
   allows area-constrained scale modes with background colour filling the rest.
+- **Frame backpressure (`VideoWorker.MAX_INFLIGHT`)** — the worker deep-copies a
+  full RGB frame per `frame_ready` emit, delivered cross-thread (queued) to the
+  GUI. Without a bound, a GUI slower than the capture rate piles frame copies in
+  Qt's unbounded event queue until the system OOMs. The worker now keeps an
+  in-flight counter: it emits only while `_inflight < MAX_INFLIGHT` (1) and
+  `_on_frame` calls `frame_consumed()` after rendering. Under load, frames are
+  dropped at the source rather than queued — memory stays flat. `frame_ready`
+  fans into the single `_on_frame` slot (preview + output feed), not two slots.
+- **Visible-rect output rendering** — both `OutputWorker._render` and
+  `VideoDisplay._refresh_output` draw the source into a zoom-scaled target rect
+  via `QPainter.drawImage/drawPixmap(targetRect, src, sourceRect)` clipped to
+  the canvas, instead of pre-scaling the whole frame with `.scaled(dw, dh)`. At
+  high zoom the old path allocated the entire dw×dh image (up to ~10 GB/frame);
+  the target-rect form only rasterises visible pixels. Zoom is also clamped to
+  ≤20 on profile load. `_render` strips QImage's 4-byte RGB888 scanline padding
+  so widths like 854 aren't shipped to ffmpeg as sheared/rolling frames.
 - **Single QSettings object per save** — previously, calling helper functions
   that each created their own QSettings object caused sync() to overwrite
   each other. All writes now go through one object before sync().
 - **In-memory dirty tracking** — changes update `self._dirty` but do not write
-  to disk. Explicit Save / close-event saves flush to disk. This prevents
-  accidental profile corruption while experimenting.
+  to disk. Only an explicit Save flushes the active profile. On close, if there
+  are unsaved changes the app prompts Save/Discard rather than silently
+  overwriting the profile (which would defeat Revert). Window geometry and the
+  global output settings are always saved on close. This prevents accidental
+  profile corruption while experimenting.
 - **v4l2loopback with `exclusive_caps=1`** — loaded with `exclusive_caps=1` so
   `V4L2_EVENT_SOURCE_CHANGE` fires reliably when the writer format changes.
   OBS receives the event and re-negotiates the pipeline to match the new

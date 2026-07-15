@@ -736,6 +736,21 @@ class MainWindow(QMainWindow):
                 v = s.value(f"cap/{dk}/{key}")
             return v if v is not None else default
 
+        def cap_int(key: str, default: int) -> int:
+            try:
+                return int(cap(key, default))
+            except (TypeError, ValueError):
+                try:
+                    return int(float(cap(key, default)))  # tolerate "30.0"
+                except (TypeError, ValueError):
+                    return default
+
+        def out_float(key: str, default: float) -> float:
+            try:
+                return float(_s(key, default) or default)
+            except (TypeError, ValueError):
+                return default
+
         def aud(key: str, default, cast=str):
             v = s.value(f"audio/{key}")
             if v is None:
@@ -756,11 +771,11 @@ class MainWindow(QMainWindow):
             video_device  = dev,
             video_fmt     = cap("fmt", "mjpeg"),
             video_res     = cap("res", "1280x720"),
-            video_fps     = int(cap("fps", 30)),
-            brightness    = int(cap("brightness", 50)),
-            contrast      = int(cap("contrast", 50)),
-            saturation    = int(cap("saturation", 50)),
-            hue           = int(cap("hue", 50)),
+            video_fps     = cap_int("fps", 30),
+            brightness    = cap_int("brightness", 50),
+            contrast      = cap_int("contrast", 50),
+            saturation    = cap_int("saturation", 50),
+            hue           = cap_int("hue", 50),
             audio_device  = adev,
             audio_enabled = _b("audio/enabled", True),
             mono_mix      = aud("mono_mix",    False, bool),
@@ -770,9 +785,11 @@ class MainWindow(QMainWindow):
             volume_r_db   = aud("volume_r_db", 0,     int),
             output_scale_mode = _s("output/scale_mode", "fit"),
             output_crop_mode  = _s("output/crop_mode",  "full"),
-            pan_x             = float(_s("output/pan_x", 0.0) or 0.0),
-            pan_y             = float(_s("output/pan_y", 0.0) or 0.0),
-            zoom              = float(_s("output/zoom",  1.0) or 1.0),
+            pan_x             = out_float("output/pan_x", 0.0),
+            pan_y             = out_float("output/pan_y", 0.0),
+            # Clamp to the same range the zoom wheel enforces, so a corrupt or
+            # hand-edited profile can't request a pathologically large zoom.
+            zoom              = max(0.1, min(20.0, out_float("output/zoom", 1.0))),
         )
 
     def _save_to_disk(self, settings: AppSettings, name: str):
@@ -812,10 +829,12 @@ class MainWindow(QMainWindow):
         self._apply_bg_color(QColor(settings.bg_color))
 
         # Video device
-        self._select_combo_by_data(self._device_combo, settings.video_device)
+        video_found = self._select_combo_by_data(self._device_combo, settings.video_device)
+        actual_video_dev = self._device_combo.currentData() or "/dev/video0"
 
-        # Caps + format/res/fps combos
-        self._caps = _query_device_caps(settings.video_device)
+        # Caps + format/res/fps combos — query the device actually selected, not
+        # the saved one, so an unplugged card doesn't populate mismatched combos.
+        self._caps = _query_device_caps(actual_video_dev)
         self._populate_fmt_combo()
 
         self._select_combo(self._fmt_combo, settings.video_fmt)
@@ -848,7 +867,7 @@ class MainWindow(QMainWindow):
             self._v4l2_labels[ctrl].setText(str(val))
 
         # Audio device
-        self._select_combo_by_data(self._audio_device_combo, settings.audio_device)
+        audio_found = self._select_combo_by_data(self._audio_device_combo, settings.audio_device)
 
         # Audio options (block signals to avoid premature restarts)
         for widget, val in [
@@ -892,22 +911,39 @@ class MainWindow(QMainWindow):
         else:
             self._stop_audio()
 
+        # Warn (last, so it isn't overwritten by the "Capturing…" message) if a
+        # saved device is gone and we silently fell back to another one.
+        missing = []
+        if not video_found:
+            missing.append(f"video device {settings.video_device}")
+        if not audio_found:
+            missing.append(f"audio device {settings.audio_device}")
+        if missing:
+            self._lbl_signal.setText("⚠ Saved " + " and ".join(missing) +
+                                     " not found — using an available device instead")
+
     # ── combo helpers ─────────────────────────────────────────────────────────
-    def _select_combo(self, combo: QComboBox, key: str):
+    def _select_combo(self, combo: QComboBox, key: str) -> bool:
         combo.blockSignals(True)
+        found = False
         for i in range(combo.count()):
             if combo.itemData(i) == key:
                 combo.setCurrentIndex(i)
+                found = True
                 break
         combo.blockSignals(False)
+        return found
 
-    def _select_combo_by_data(self, combo: QComboBox, data):
+    def _select_combo_by_data(self, combo: QComboBox, data) -> bool:
         combo.blockSignals(True)
+        found = False
         for i in range(combo.count()):
             if combo.itemData(i) == data:
                 combo.setCurrentIndex(i)
+                found = True
                 break
         combo.blockSignals(False)
+        return found
 
     # ── profile operations ────────────────────────────────────────────────────
     def _populate_profile_combo(self):
@@ -949,14 +985,37 @@ class MainWindow(QMainWindow):
             if clicked == save_sw:
                 self._save_to_disk(self._collect_settings(), self._current_profile)
             elif clicked == save_new:
-                new_name, ok = QInputDialog.getText(
+                raw, ok = QInputDialog.getText(
                     self, "Save as New Profile", "Profile name:"
                 )
-                if ok and new_name.strip() and new_name.strip() != name:
-                    self._save_to_disk(self._collect_settings(), new_name.strip())
+                new_name = self._sanitize_profile_name(raw) if ok else None
+                if new_name and new_name != name and self._confirm_overwrite(new_name):
+                    self._save_to_disk(self._collect_settings(), new_name)
                     self._populate_profile_combo()
 
         self._switch_profile(name)
+
+    def _sanitize_profile_name(self, name: str) -> str | None:
+        """Return a safe profile name, or None if empty/reserved/illegal.
+
+        The name is interpolated straight into a file path (_profile_path), so
+        reject anything with path separators or traversal.
+        """
+        name = (name or "").strip()
+        if not name or name == "Default":
+            return None
+        if "/" in name or "\\" in name or ".." in name or name != Path(name).name:
+            return None
+        return name
+
+    def _confirm_overwrite(self, name: str) -> bool:
+        """True if the profile may be written — asking first if it already exists."""
+        if not self._profile_path(name).exists():
+            return True
+        return QMessageBox.question(
+            self, "Overwrite Profile?",
+            f'Profile "{name}" already exists. Overwrite it with the current settings?',
+        ) == QMessageBox.StandardButton.Yes
 
     def _switch_profile(self, name: str):
         self._current_profile = name
@@ -964,6 +1023,9 @@ class MainWindow(QMainWindow):
         self._del_profile_btn.setEnabled(name != "Default")
         settings = self._load_from_disk(name)
         self._apply_settings(settings)
+        # Keep the combo showing the profile that is actually active (e.g. after
+        # a "Save as New Profile…" switch that left it pointing at the old one).
+        self._populate_profile_combo()
         self._clear_dirty()
 
     def _save_profile(self):
@@ -979,10 +1041,18 @@ class MainWindow(QMainWindow):
         self._clear_dirty()
 
     def _new_profile(self):
-        name, ok = QInputDialog.getText(self, "New Profile", "Profile name:")
-        if not ok or not name.strip():
+        raw, ok = QInputDialog.getText(self, "New Profile", "Profile name:")
+        if not ok:
             return
-        name = name.strip()
+        name = self._sanitize_profile_name(raw)
+        if name is None:
+            QMessageBox.warning(
+                self, "Invalid Name",
+                "Profile name can't be empty, 'Default', or contain path separators.",
+            )
+            return
+        if not self._confirm_overwrite(name):
+            return
         self._save_to_disk(self._collect_settings(), name)
         self._current_profile = name
         self._populate_profile_combo()
@@ -1174,8 +1244,9 @@ class MainWindow(QMainWindow):
         w, h, fps, fmt, dev = self._cap_params()
         wk = VideoWorker()
         wk.configure(w, h, fps, fmt, dev)
-        wk.frame_ready.connect(self._display.set_frame)
-        wk.frame_ready.connect(self._feed_output)
+        # One slot handles both the preview and the output feed, then tells the
+        # worker the frame is done so it can send the next one (backpressure).
+        wk.frame_ready.connect(self._on_frame)
         wk.fps_updated.connect(lambda f: self._lbl_fps.setText(f"FPS: {f:.1f}"))
         wk.error.connect(lambda e: self._lbl_signal.setText(f"Error: {e}"))
         self._video_worker = wk
@@ -1186,8 +1257,15 @@ class MainWindow(QMainWindow):
 
     def _stop_video(self):
         if self._video_worker:
-            self._video_worker.stop()
-            self._video_worker.wait(3000)
+            wk = self._video_worker
+            # Disconnect first so a thread that is slow to exit can't keep
+            # delivering frames to the display after we've dropped it.
+            try:
+                wk.frame_ready.disconnect(self._on_frame)
+            except TypeError:
+                pass
+            wk.stop()
+            wk.wait(3000)
             self._video_worker = None
         self._display.clear_signal()
         self._lbl_fps.setText("FPS: --")
@@ -1330,7 +1408,9 @@ class MainWindow(QMainWindow):
         enabled = state == Qt.CheckState.Checked.value
         if enabled:
             selected = self._output_video_combo.currentData() or ""
-            if selected:
+            # Only reuse the selected device if it still exists; a previous
+            # disable may have unloaded it, leaving a dead node in the combo.
+            if selected and Path(selected).exists():
                 self._on_v4l2_loaded(selected, False)
             else:
                 self._lbl_signal.setText("Loading v4l2loopback…")
@@ -1344,6 +1424,8 @@ class MainWindow(QMainWindow):
                 _unload_v4l2loopback()
                 self._v4l2_loaded_by_us = False
             self._v4l2_device = ""
+            # Rescan so the just-unloaded device is dropped from the combo.
+            self._populate_output_video_combo()
             w, h = self._out_res_combo.currentData() or (1920, 1080)
             self._display.set_output_mode(False, w, h)
             self._stop_audio(teardown_virtual=True)
@@ -1436,6 +1518,13 @@ class MainWindow(QMainWindow):
             self._stop_output()  # close device now → triggers SOURCE_CHANGE to readers
             QTimer.singleShot(400, self._start_output)  # reopen after readers react
 
+    def _on_frame(self, img: QImage):
+        self._display.set_frame(img)
+        self._feed_output(img)
+        wk = self._video_worker
+        if wk is not None:
+            wk.frame_consumed()
+
     def _feed_output(self, img: QImage):
         if self._output_worker is not None:
             pan_x, pan_y, zoom = self._display.get_pan_zoom()
@@ -1493,11 +1582,20 @@ class MainWindow(QMainWindow):
         self._out_enabled.setChecked(False)
         self._out_enabled.blockSignals(False)
 
+        # Restore the enabled state, but only when the saved loopback device is
+        # already present — auto-enabling otherwise would fire a modprobe/pkexec
+        # prompt at launch, which the user didn't ask for.
+        if os.enabled and os.device and os.device in _find_loopback_devices():
+            self._out_enabled.setChecked(True)  # unblocked → enables via existing device
+
     def _save_output_settings(self):
         w, h = self._out_res_combo.currentData() or (1920, 1080)
+        # Fall back to the combo's device so disabling output (which clears
+        # _v4l2_device) doesn't erase the remembered device.
+        device = self._v4l2_device or (self._output_video_combo.currentData() or "")
         gs = QSettings("HagibisMonitor", "HagibisMonitor")
         gs.setValue("output/enabled",      self._out_enabled.isChecked())
-        gs.setValue("output/device",       self._v4l2_device)
+        gs.setValue("output/device",       device)
         gs.setValue("output/width",        w)
         gs.setValue("output/height",       h)
         gs.setValue("output/pixel_format", self._out_pix_fmt_combo.currentData() or "yuyv422")
@@ -1605,7 +1703,16 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self._save_output_settings()
         self._save_global()
-        self._save_to_disk(self._collect_settings(), self._current_profile)
+        # Don't silently overwrite the profile with unsaved experimental changes
+        # (that would defeat Revert). Ask; if clean, disk already matches.
+        if self._dirty:
+            resp = QMessageBox.question(
+                self, "Unsaved Changes",
+                f'Save changes to profile "{self._current_profile}" before quitting?',
+                QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard,
+            )
+            if resp == QMessageBox.StandardButton.Save:
+                self._save_to_disk(self._collect_settings(), self._current_profile)
         self._stop_output()
         if self._v4l2_loaded_by_us:
             _unload_v4l2loopback(silent=True)  # no pkexec dialog on exit

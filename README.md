@@ -708,6 +708,22 @@ sudo modprobe -r v4l2loopback
 **60 fps in MJPEG at 1920×1080** — confirmed supported by the Hagibis device.
 If the pipeline drops frames, lower the resolution or frame rate.
 
+**Frames are dropped, not queued, under load** — the capture worker holds at
+most one un-rendered frame in flight. If the GUI can't keep up (heavy zoom,
+a slow machine, a busy compositor), newer frames are dropped at the source
+rather than buffered. This keeps memory flat; the trade-off is that the
+preview/output framerate follows what the GUI can actually paint. Earlier
+versions buffered every frame and could exhaust system memory.
+
+**Output re-enables itself on launch (only if the device survived)** — if you
+quit with Output on and the v4l2loopback device is still present next launch,
+Output turns back on automatically without a `pkexec` prompt. If the device is
+gone, Output stays off so launching never triggers a module-load prompt.
+
+**Missing saved device** — if a profile's saved video or audio device isn't
+present at load, the app falls back to an available device and shows a warning
+in the status bar instead of silently capturing the wrong one.
+
 ---
 
 ## For AI agents

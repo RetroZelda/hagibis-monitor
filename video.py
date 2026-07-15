@@ -2,7 +2,7 @@ import glob
 import re
 import subprocess
 
-from PyQt6.QtCore import Qt, QPoint, QRect, pyqtSignal
+from PyQt6.QtCore import Qt, QPoint, QRect, QRectF, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import QLabel, QSizePolicy
 
@@ -70,6 +70,10 @@ class VideoDisplay(QLabel):
         self._pixmap:    QPixmap | None = None
         self._render_px: QPixmap | None = None
         self._render_pt: QPoint = QPoint(0, 0)
+        # Output mode draws _render_px (the unscaled source) into this target
+        # rect via QPainter sampling, so a large zoom never materialises a
+        # multi-GB scaled pixmap. None in normal (non-output) mode.
+        self._render_target: QRectF | None = None
         self._scale_mode:        str = "fit"
         self._crop_mode:         str = "full"
         self._output_scale_mode: str = "fit"
@@ -174,6 +178,7 @@ class VideoDisplay(QLabel):
         self.update()
 
     def _refresh_normal(self, W: int, H: int):
+        self._render_target = None
         px   = self._cropped(self._pixmap)
         fast = Qt.TransformationMode.FastTransformation
         mode = self._scale_mode
@@ -221,16 +226,16 @@ class VideoDisplay(QLabel):
 
         if not self._pixmap:
             self._render_px = None
+            self._render_target = None
             return
 
         px = self._cropped(self._pixmap, self._output_crop_mode)
         src_w, src_h = px.width(), px.height()
         if src_w == 0 or src_h == 0:
             self._render_px = None
+            self._render_target = None
             return
 
-        fast   = Qt.TransformationMode.FastTransformation
-        ignore = Qt.AspectRatioMode.IgnoreAspectRatio
         mode   = self._output_scale_mode
         cw, ch = canvas_w, canvas_h
 
@@ -255,13 +260,15 @@ class VideoDisplay(QLabel):
             s = min(cw / src_w, ch / src_h) * self._zoom
             dw, dh = max(1, int(src_w * s)), max(1, int(src_h * s))
 
-        cx = canvas_x + cw // 2
-        cy = canvas_y + ch // 2
-        dx = cx - dw // 2 + int(self._pan_x * disp_scale)
-        dy = cy - dh // 2 + int(self._pan_y * disp_scale)
+        cx = canvas_x + cw / 2
+        cy = canvas_y + ch / 2
+        dx = cx - dw / 2 + self._pan_x * disp_scale
+        dy = cy - dh / 2 + self._pan_y * disp_scale
 
-        self._render_px = px.scaled(dw, dh, ignore, fast)
-        self._render_pt = QPoint(dx, dy)
+        # Keep the unscaled source; paintEvent samples it into this target rect
+        # clipped to the canvas, so zoom never allocates a giant pixmap here.
+        self._render_px = px
+        self._render_target = QRectF(dx, dy, float(dw), float(dh))
 
     def resizeEvent(self, event):
         self._refresh()
@@ -272,9 +279,11 @@ class VideoDisplay(QLabel):
 
         if self._output_enabled and not self._canvas_rect.isNull():
             p.fillRect(self._canvas_rect, self._bg_color)
-            if self._render_px is not None:
+            if self._render_px is not None and self._render_target is not None:
                 p.setClipRect(self._canvas_rect)
-                p.drawPixmap(self._render_pt, self._render_px)
+                p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+                p.drawPixmap(self._render_target, self._render_px,
+                             QRectF(self._render_px.rect()))
                 p.setClipping(False)
             pen = QPen(QColor("#00e5a0"), 2)
             p.setPen(pen)

@@ -6,7 +6,7 @@ on:
       version:
         description: 'Release version — omit the "v" prefix (e.g. 1.2.0). Check the previous tag shown in the first step if unsure. Version numbering should be "{major}.{minor}.{patch}" and follow semver principles. This will be used as the release tag and in the archive name, so choose carefully and sequentially!'
         required: true
-        default: '1.1.3'
+        default: '1.1.4'
   push:
     branches:
       - main
@@ -40,9 +40,13 @@ jobs:
 
       - name: Resolve version
         id: ver
+        env:
+          # Pass the untrusted dispatch input via env, never inline into the
+          # script body, to avoid shell injection.
+          INPUT_VERSION: ${{ github.event.inputs.version }}
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            RAW="${{ github.event.inputs.version }}"
+            RAW="$INPUT_VERSION"
           else
             # Push trigger: read the version from the default: line in this file.
             # Keeps a single source of truth — bumping the default in a commit
@@ -54,6 +58,10 @@ jobs:
             fi
           fi
           RAW="${RAW#v}"   # strip leading v if user included it
+          if ! printf '%s' "$RAW" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "Version '$RAW' is not in X.Y.Z form — aborting."
+            exit 1
+          fi
           TAG="v${RAW}"
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "Resolved release tag: ${TAG}"
@@ -66,14 +74,6 @@ jobs:
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
-
-      - name: Create and push tag
-        if: steps.ver.outputs.skip != 'true'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag "${{ steps.ver.outputs.tag }}"
-          git push origin "${{ steps.ver.outputs.tag }}"
 
       - uses: actions/setup-python@v5
         if: steps.ver.outputs.skip != 'true'
@@ -99,7 +99,7 @@ jobs:
 
       - name: Install Python dependencies
         if: steps.ver.outputs.skip != 'true'
-        run: pip install pyinstaller PyQt6 numpy
+        run: pip install pyinstaller -r requirements.txt
 
       - name: Build
         if: steps.ver.outputs.skip != 'true'
@@ -119,6 +119,10 @@ jobs:
         if: steps.ver.outputs.skip != 'true'
         uses: softprops/action-gh-release@v2
         with:
+          # Create the tag here, atomically with the release, only after the
+          # build and package steps have succeeded — so a build failure can't
+          # leave a dangling tag that permanently wedges the version number.
           tag_name: ${{ steps.ver.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           files: ${{ env.ARCHIVE }}
           generate_release_notes: true

@@ -1,9 +1,10 @@
 import os
 import queue
+import threading
 import subprocess
 import time
 import numpy as np
-from PyQt6.QtCore import QThread, Qt, pyqtSignal
+from PyQt6.QtCore import QThread, QRectF, pyqtSignal
 from PyQt6.QtGui import QColor, QImage, QPainter
 
 
@@ -11,6 +12,12 @@ class VideoWorker(QThread):
     frame_ready = pyqtSignal(QImage)
     fps_updated = pyqtSignal(float)
     error = pyqtSignal(str)
+
+    # At most this many emitted-but-not-yet-displayed frames may be in flight.
+    # Because the receivers live on the GUI thread (queued connection), an
+    # unbounded producer would pile full-frame copies into Qt's event queue
+    # faster than the GUI drains them — the primary out-of-memory cause.
+    MAX_INFLIGHT = 1
 
     def __init__(self):
         super().__init__()
@@ -21,6 +28,14 @@ class VideoWorker(QThread):
         self.device = "/dev/video0"
         self._running = False
         self._proc = None
+        self._inflight = 0
+        self._inflight_lock = threading.Lock()
+
+    def frame_consumed(self):
+        """Called on the GUI thread once a delivered frame has been rendered."""
+        with self._inflight_lock:
+            if self._inflight > 0:
+                self._inflight -= 1
 
     def configure(self, width: int, height: int, fps: int, input_format: str, device: str = "/dev/video0"):
         self.width = width
@@ -51,19 +66,25 @@ class VideoWorker(QThread):
             return
 
         frame_size = self.width * self.height * 3
+        stride = self.width * 3
+        # Read each frame into one preallocated buffer via readinto(); the old
+        # `raw += chunk` accumulation was O(n²) (~0.9 GB memcpy per 1440p frame,
+        # since a bufsize=0 pipe hands back ≤64 KiB per read).
+        buf = bytearray(frame_size)
+        view = memoryview(buf)
         prev = time.monotonic()
         count = 0
 
         while self._running:
-            raw = b""
-            while len(raw) < frame_size and self._running:
-                chunk = self._proc.stdout.read(frame_size - len(raw))
-                if not chunk:
+            filled = 0
+            while filled < frame_size and self._running:
+                n = self._proc.stdout.readinto(view[filled:])
+                if not n:
                     self._running = False
                     break
-                raw += chunk
+                filled += n
 
-            if not self._running or len(raw) < frame_size:
+            if not self._running or filled < frame_size:
                 break
 
             count += 1
@@ -73,7 +94,14 @@ class VideoWorker(QThread):
                 count = 0
                 prev = now
 
-            img = QImage(raw, self.width, self.height, self.width * 3,
+            # Backpressure: if the GUI hasn't finished the previous frame, drop
+            # this one instead of queuing another full-frame copy behind it.
+            with self._inflight_lock:
+                if self._inflight >= self.MAX_INFLIGHT:
+                    continue
+                self._inflight += 1
+
+            img = QImage(buf, self.width, self.height, stride,
                          QImage.Format.Format_RGB888)
             self.frame_ready.emit(img.copy())
 
@@ -219,16 +247,11 @@ class OutputWorker(QThread):
         src_w, src_h = src.width(), src.height()
         W, H = self._width, self._height
         if src_w > 0 and src_h > 0:
-            smooth  = Qt.TransformationMode.SmoothTransformation
-            ignore  = Qt.AspectRatioMode.IgnoreAspectRatio
-            clip    = False
-
             if scale_mode == "stretch":
                 dw, dh = max(1, int(W * zoom)), max(1, int(H * zoom))
             elif scale_mode == "fill":
                 s = max(W / src_w, H / src_h) * zoom
                 dw, dh = max(1, int(src_w * s)), max(1, int(src_h * s))
-                clip = True
             elif scale_mode == "native":
                 dw, dh = max(1, int(src_w * zoom)), max(1, int(src_h * zoom))
             elif scale_mode.startswith("area_"):
@@ -244,17 +267,29 @@ class OutputWorker(QThread):
                 s = min(W / src_w, H / src_h) * zoom
                 dw, dh = max(1, int(src_w * s)), max(1, int(src_h * s))
 
-            dx = int((W - dw) / 2 + pan_x)
-            dy = int((H - dh) / 2 + pan_y)
-            scaled = src.scaled(dw, dh, ignore, smooth)
+            dx = (W - dw) / 2 + pan_x
+            dy = (H - dh) / 2 + pan_y
+            # Draw with a target rect and let QPainter sample only the pixels
+            # that land inside the WxH canvas. Materialising the full dw x dh
+            # scaled image first (the old src.scaled(dw, dh)) allocated up to
+            # ~10 GB per frame at high zoom — an out-of-memory / null-image bug.
             p = QPainter(out)
-            if clip:
-                p.setClipRect(0, 0, W, H)
-            p.drawImage(dx, dy, scaled)
+            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+            p.drawImage(QRectF(dx, dy, dw, dh), src,
+                        QRectF(0.0, 0.0, float(src_w), float(src_h)))
             p.end()
+
+        # QImage RGB888 pads each scanline to a 4-byte boundary; ffmpeg expects
+        # packed width*3 rows, so strip the padding for widths where W*3 isn't a
+        # multiple of 4 (e.g. 854) — otherwise the loopback output shears/rolls.
         ptr = out.bits()
         ptr.setsize(out.sizeInBytes())
-        return bytes(ptr)
+        raw = bytes(ptr)
+        bpl = out.bytesPerLine()
+        packed = W * 3
+        if bpl == packed:
+            return raw
+        return b"".join(raw[y * bpl:y * bpl + packed] for y in range(H))
 
 
 class AudioWorker(QThread):
