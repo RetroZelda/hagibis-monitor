@@ -372,14 +372,18 @@ class AppSettings:
   the writer closing before a new writer connects), then starts a new worker
   at the new resolution.
 - **Screen-wake inhibitor (`power.py`)** — `MainWindow` holds a
-  `ScreenWakeInhibitor` for the whole session: `inhibit()` at the end of
-  `__init__`, `release()` in `closeEvent`. It calls the freedesktop
-  `org.freedesktop.ScreenSaver` D-Bus `Inhibit`/`UnInhibit` (via `QtDBus`) — the
-  same lock video players use — and falls back to a `systemd-inhibit` idle/sleep
-  block. The lock is session-scoped (held whenever the app is open, even
-  minimized or with no signal), matching "keep the screen on like a video
-  player". If a future change should instead tie it to active video, gate
-  `inhibit()`/`release()` on `_start_video()`/`_stop_video()`.
+  `ScreenWakeInhibitor`. It calls the freedesktop `org.freedesktop.ScreenSaver`
+  D-Bus `Inhibit`/`UnInhibit` (via `QtDBus`) — the same lock video players use —
+  and falls back to a `systemd-inhibit` idle/sleep block. The lock is
+  session-scoped (held whenever the app is open, even minimized or with no
+  signal). It is controlled by the **"Keep screen awake while running"**
+  checkbox on the Video tab, a **global** setting stored at `power/keep_awake`
+  in `HagibisMonitor.ini` (default on) — NOT per-profile, so switching profiles
+  never changes it. `__init__` applies it via `_apply_screen_wake(...)` after
+  `_load_settings()`; `_on_keep_awake_changed` persists and applies it live;
+  `closeEvent` calls `release()` unconditionally (safe no-op if not held). If a
+  future change should tie it to active video instead, gate
+  `_apply_screen_wake()` on `_start_video()`/`_stop_video()`.
 
 ## Things not yet implemented
 

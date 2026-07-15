@@ -420,6 +420,7 @@ from inside the extracted directory — same options as above.
 │                                                   │ │  Crop       ▾    │ │
 │                                                   │ │  Background ████ │ │
 │                                                   │ └──────────────────┘ │
+│                                                   │ ☑ Keep screen awake  │
 │                                                   │ ┌──────────────────┐ │
 │                                                   │ │ Image Controls   │ │
 │                                                   │ │  Brightness ━●── │ │
@@ -512,8 +513,10 @@ When switching away from a profile with unsaved changes, a dialog offers:
 - **Save as New Profile…** — name a new profile, save there, then switch
 - **Cancel** — stay on the current profile
 
-Every setting in the UI is profile-aware. The profile is auto-saved when
-the app closes, so the last session is always restored.
+Most settings in the UI are profile-aware. A few are **global** (shared by
+every profile): the output device/resolution/format/fps, window geometry, and
+the "Keep screen awake while running" toggle. On close, if the active profile
+has unsaved changes the app asks whether to save them.
 
 ### What each profile stores
 
@@ -738,7 +741,10 @@ in the status bar instead of silently capturing the wrong one.
 screensaver / display sleep for as long as it is open (via the desktop's
 `org.freedesktop.ScreenSaver` D-Bus service, or `systemd-inhibit` as a
 fallback), and releases it on close. This is session-wide: the screen stays on
-even if the window is minimized or the capture card is sending no signal.
+even if the window is minimized or the capture card is sending no signal. It is
+controlled by the **"Keep screen awake while running"** checkbox on the Video
+tab — a global setting (on by default) that applies to every profile, so
+switching profiles never changes it.
 
 ---
 

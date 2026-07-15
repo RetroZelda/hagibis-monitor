@@ -112,7 +112,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._apply_dark_theme()
         self._load_settings()
-        self._screen_wake.inhibit()
+        self._apply_screen_wake(self._keep_awake.isChecked())
 
     # ── UI construction ───────────────────────────────────────────────────────
     def _build_ui(self):
@@ -310,6 +310,17 @@ class MainWindow(QMainWindow):
         self._bg_color_btn.clicked.connect(self._pick_bg_color)
         dl.addWidget(self._bg_color_btn)
         layout.addWidget(disp)
+
+        # Global (all-profiles) app setting, not part of the profile.
+        self._keep_awake = QCheckBox("Keep screen awake while running")
+        self._keep_awake.setChecked(True)
+        self._keep_awake.setToolTip(
+            "Prevent the screen from dimming, blanking, or sleeping while the app\n"
+            "is open — like a video player.\n"
+            "Saved globally and applies to every profile."
+        )
+        self._keep_awake.stateChanged.connect(self._on_keep_awake_changed)
+        layout.addWidget(self._keep_awake)
 
         img = QGroupBox("Image Controls")
         il = QVBoxLayout(img)
@@ -1087,11 +1098,18 @@ class MainWindow(QMainWindow):
         self._panel_scroll.setVisible(panel_visible)
         self._panel_toggle.setText("◀" if panel_visible else "▶")
 
+        # Global app setting (not per-profile): keep the screen awake.
+        keep_awake = gs.value("power/keep_awake", True, type=bool)
+        self._keep_awake.blockSignals(True)
+        self._keep_awake.setChecked(keep_awake)
+        self._keep_awake.blockSignals(False)
+
         # Migrate old flat settings into Default.ini if it doesn't exist yet
         if not self._profile_path("Default").exists():
             ps = self._profile_settings("Default")
             for key in gs.allKeys():
-                if not key.startswith("window/") and key != "profile/current":
+                if (not key.startswith("window/") and not key.startswith("power/")
+                        and key != "profile/current"):
                     ps.setValue(key, gs.value(key))
             ps.sync()
 
@@ -1111,6 +1129,19 @@ class MainWindow(QMainWindow):
         gs.setValue("window/state",        self.saveState())
         gs.setValue("window/panel_visible", self._panel_scroll.isVisible())
         gs.setValue("profile/current",     self._current_profile)
+        gs.setValue("power/keep_awake",    self._keep_awake.isChecked())
+
+    # ── screen-wake (global setting) ──────────────────────────────────────────
+    def _on_keep_awake_changed(self, state: int):
+        enabled = state == Qt.CheckState.Checked.value
+        QSettings("HagibisMonitor", "HagibisMonitor").setValue("power/keep_awake", enabled)
+        self._apply_screen_wake(enabled)
+
+    def _apply_screen_wake(self, enabled: bool):
+        if enabled:
+            self._screen_wake.inhibit()
+        else:
+            self._screen_wake.release()
 
     # ── dynamic combo population ──────────────────────────────────────────────
     def _populate_fmt_combo(self):
