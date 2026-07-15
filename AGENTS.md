@@ -167,6 +167,7 @@ for the full file tree):
 | `utils.py` | Small shared helpers (`_dev_key`, `_aspect_label`, `_sbin`, `_slider_row`, `_db_label`) |
 | `workers.py` | `VideoWorker`, `AudioWorker`, `OutputWorker` — all three `QThread` subprocess drivers |
 | `vu_meter.py` | `VuMeter`, `DbScale`, `StereoVuMeter` |
+| `power.py` | `ScreenWakeInhibitor` — keeps the screen awake while the app is open |
 
 `MainWindow` in `ui.py` is intentionally monolithic — it owns every widget
 and every worker, and orchestrates profile load/save, stream restarts,
@@ -187,10 +188,12 @@ flowchart TD
     vu[vu_meter.py<br/>VuMeter / DbScale / StereoVuMeter]
     settings[settings.py<br/>AppSettings / OutputSettings + const tables]
     utils[utils.py<br/>_dev_key / _aspect_label / _sbin / _slider_row / _db_label]
+    power[power.py<br/>ScreenWakeInhibitor]
 
     main --> ui
     ui --> video
     ui --> audio
+    ui --> power
     ui --> output
     ui --> workers
     ui --> vu
@@ -200,8 +203,9 @@ flowchart TD
 ```
 
 Notes:
-- `workers.py`, `vu_meter.py`, `video.py`, `audio.py`, and `settings.py` have
-  no project-local imports — they only depend on PyQt6, numpy, and stdlib.
+- `workers.py`, `vu_meter.py`, `video.py`, `audio.py`, `settings.py`, and
+  `power.py` have no project-local imports — they only depend on PyQt6, numpy,
+  and stdlib.
 - Only `ui.py` reaches across modules to wire things together; nothing
   outside `ui.py` depends on `MainWindow`.
 
@@ -367,6 +371,15 @@ class AppSettings:
   OutputWorker, waits 400 ms (for OBS to fully process the SOURCE_CHANGE from
   the writer closing before a new writer connects), then starts a new worker
   at the new resolution.
+- **Screen-wake inhibitor (`power.py`)** — `MainWindow` holds a
+  `ScreenWakeInhibitor` for the whole session: `inhibit()` at the end of
+  `__init__`, `release()` in `closeEvent`. It calls the freedesktop
+  `org.freedesktop.ScreenSaver` D-Bus `Inhibit`/`UnInhibit` (via `QtDBus`) — the
+  same lock video players use — and falls back to a `systemd-inhibit` idle/sleep
+  block. The lock is session-scoped (held whenever the app is open, even
+  minimized or with no signal), matching "keep the screen on like a video
+  player". If a future change should instead tie it to active video, gate
+  `inhibit()`/`release()` on `_start_video()`/`_stop_video()`.
 
 ## Things not yet implemented
 

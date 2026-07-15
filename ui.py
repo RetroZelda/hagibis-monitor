@@ -25,6 +25,7 @@ from settings import (
     _OUTPUT_RESOLUTIONS, _OUTPUT_PIXEL_FORMATS, _OUTPUT_FPS,
 )
 from utils import _dev_key, _aspect_label, _slider_row, _db_label
+from power import ScreenWakeInhibitor
 
 
 # ── status bar ────────────────────────────────────────────────────────────────
@@ -105,9 +106,13 @@ class MainWindow(QMainWindow):
         self._res_tab_selection: dict[str, tuple[int, int]] = {}
         self._output_settings: OutputSettings = OutputSettings()
 
+        # Keep the screen awake while the app is open, like a video player.
+        self._screen_wake = ScreenWakeInhibitor()
+
         self._build_ui()
         self._apply_dark_theme()
         self._load_settings()
+        self._screen_wake.inhibit()
 
     # ── UI construction ───────────────────────────────────────────────────────
     def _build_ui(self):
@@ -1719,4 +1724,5 @@ class MainWindow(QMainWindow):
             self._v4l2_loaded_by_us = False
         self._stop_audio(teardown_virtual=True)
         self._stop_video()
+        self._screen_wake.release()  # let the screen sleep normally again
         event.accept()

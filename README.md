@@ -125,6 +125,7 @@ hagibis-monitor/
 ├── utils.py      # Small shared helpers (_dev_key, _aspect_label, _sbin, _slider_row, _db_label)
 ├── workers.py    # VideoWorker, AudioWorker, OutputWorker (QThread subclasses)
 ├── vu_meter.py   # VuMeter, DbScale, StereoVuMeter custom widgets
+├── power.py      # ScreenWakeInhibitor — keeps the screen awake while the app is open
 ├── .gitignore
 └── .vscode/
     └── launch.json   # VS Code debugpy configuration
@@ -268,6 +269,15 @@ Tiny shared helpers used by `ui.py` and `output.py`:
 −20, −40, −60 dBFS.
 
 `StereoVuMeter(QWidget)` — L meter / scale / R meter layout; `set_levels(l, r)`.
+
+### power.py
+
+`ScreenWakeInhibitor` — keeps the display from dimming, blanking, or sleeping
+while the app is open, the same way a video player does. `MainWindow` calls
+`inhibit()` at startup and `release()` on close. It uses the freedesktop
+`org.freedesktop.ScreenSaver` D-Bus interface (honoured by GNOME, KDE and most
+desktops, X11 and Wayland), and falls back to `systemd-inhibit` if that call
+isn't available. If neither works it silently does nothing.
 
 ---
 
@@ -723,6 +733,12 @@ gone, Output stays off so launching never triggers a module-load prompt.
 **Missing saved device** — if a profile's saved video or audio device isn't
 present at load, the app falls back to an available device and shows a warning
 in the status bar instead of silently capturing the wrong one.
+
+**Screen stays awake while open** — like a video player, the app inhibits the
+screensaver / display sleep for as long as it is open (via the desktop's
+`org.freedesktop.ScreenSaver` D-Bus service, or `systemd-inhibit` as a
+fallback), and releases it on close. This is session-wide: the screen stays on
+even if the window is minimized or the capture card is sending no signal.
 
 ---
 

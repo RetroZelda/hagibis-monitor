@@ -13,10 +13,12 @@ a = Analysis(
     binaries=qt_binaries,
     datas=qt_datas,
     hiddenimports=qt_hidden + [
+        "PyQt6.QtDBus",
         "ui",
         "video",
         "audio",
         "output",
+        "power",
         "settings",
         "utils",
         "workers",
