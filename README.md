@@ -1,9 +1,15 @@
 # Hagibis Monitor
 
 A PyQt6 desktop application for live monitoring and control of USB capture
-cards on Linux. Originally built around the **Hagibis USB Capture Card**
+cards. Originally built around the **Hagibis USB Capture Card**
 (MS2130 / MacroSilicon chipset, USB ID `345f:2130`) but works with any
-V4L2-compatible capture device.
+UVC / V4L2-compatible capture device.
+
+**Linux** is the primary platform (full feature set). **Windows is supported
+since v1.3.0** for live monitoring — video preview, capture selection, image
+controls, audio VU/passthrough — but **not** the virtual camera or virtual
+microphone (both rely on Linux-only subsystems). See
+[Windows support & limitations](#windows-support--limitations).
 
 ---
 
@@ -18,13 +24,14 @@ V4L2-compatible capture device.
 3. [Project layout](#project-layout)
 4. [Dependencies](#dependencies)
 5. [Running the app](#running-the-app)
-6. [UI walkthrough](#ui-walkthrough)
-7. [Profiles](#profiles)
-8. [Video display options](#video-display-options)
-9. [Audio](#audio)
-10. [Output (virtual camera + virtual mic)](#output-virtual-camera--virtual-mic)
-11. [Known quirks and gotchas](#known-quirks-and-gotchas)
-12. [For AI agents](#for-ai-agents)
+6. [Windows support & limitations](#windows-support--limitations)
+7. [UI walkthrough](#ui-walkthrough)
+8. [Profiles](#profiles)
+9. [Video display options](#video-display-options)
+10. [Audio](#audio)
+11. [Output (virtual camera + virtual mic)](#output-virtual-camera--virtual-mic)
+12. [Known quirks and gotchas](#known-quirks-and-gotchas)
+13. [For AI agents](#for-ai-agents)
 
 > **AI / coding agents:** before doing any work in this repo, read both
 > this README and [AGENTS.md](AGENTS.md). AGENTS.md contains the rules
@@ -116,29 +123,44 @@ V4L2-compatible capture device.
 
 ```
 hagibis-monitor/
-├── main.py       # Entry point — constructs QApplication + MainWindow
-├── ui.py         # MainWindow + _StatusBar — all UI construction, profile mgmt, stream orchestration
-├── video.py      # VideoDisplay widget + video device scanning / capability querying
-├── audio.py      # Audio device scanning (PulseAudio sources → ALSA fallback)
-├── output.py     # v4l2loopback discovery / load / unload + _ModprobeWorker
-├── settings.py   # AppSettings + OutputSettings dataclasses + resolution/format/fps constant tables
-├── utils.py      # Small shared helpers (_dev_key, _aspect_label, _sbin, _slider_row, _db_label)
-├── workers.py    # VideoWorker, AudioWorker, OutputWorker (QThread subclasses)
-├── vu_meter.py   # VuMeter, DbScale, StereoVuMeter custom widgets
-├── power.py      # ScreenWakeInhibitor — keeps the screen awake while the app is open
+├── main.py           # Entry point — constructs QApplication + MainWindow
+├── ui.py             # MainWindow + _StatusBar — all UI construction, profile mgmt, stream orchestration
+├── video.py          # VideoDisplay widget + video device scanning / caps (V4L2 or dshow)
+├── audio.py          # Audio device scanning (PulseAudio → ALSA, or dshow on Windows)
+├── output.py         # v4l2loopback discovery / load / unload + _ModprobeWorker (Linux only)
+├── camera_controls.py# Windows image controls via DirectShow IAMVideoProcAmp (comtypes)
+├── settings.py       # AppSettings/OutputSettings dataclasses, constant tables, QSettings factory
+├── utils.py          # Small shared helpers (_dev_key, _aspect_label, _sbin, _slider_row, _db_label)
+├── workers.py        # VideoWorker, AudioWorker, OutputWorker (QThread subclasses)
+├── vu_meter.py       # VuMeter, DbScale, StereoVuMeter custom widgets
+├── power.py          # ScreenWakeInhibitor — keeps the screen awake while the app is open
+├── build.py          # Cross-platform build script (venv + PyInstaller); build.sh wraps it
+├── build.sh          # Linux convenience wrapper around build.py
+├── install.sh        # Linux per-user / system installer + desktop entry
+├── hagibis-monitor.spec       # PyInstaller spec (platform-conditional)
+├── hagibis-monitor.desktop    # Linux desktop entry
+├── requirements.txt  # Runtime deps (Windows-only ones behind PEP 508 markers)
 ├── .gitignore
+├── .github/workflows/release.yml   # CI: resolve → build (Linux + Windows) → release
 └── .vscode/
     └── launch.json   # VS Code debugpy configuration
 ```
 
-Settings are stored in:
+Settings are stored per-platform:
+
+- **Linux** — `~/.config/HagibisMonitor/HagibisMonitor.conf` (Qt NativeFormat)
+  plus a `profiles/` sibling directory.
+- **Windows** — `%APPDATA%\HagibisMonitor\HagibisMonitor.ini` (Qt IniFormat,
+  forced so the settings file is a real path rather than the registry) plus a
+  `profiles\` sibling directory.
+
 ```
-~/.config/HagibisMonitor/
-├── HagibisMonitor.ini        # window geometry + output settings (global)
+<settings dir>/
+├── HagibisMonitor.{conf,ini}    # window geometry + global output settings
 └── profiles/
-    ├── Default.ini           # always present; created on first launch
-    ├── GBC.ini               # example user profile
-    └── N64.ini               # example user profile
+    ├── Default.ini              # always present; created on first launch
+    ├── GBC.ini                  # example user profile
+    └── N64.ini                  # example user profile
 ```
 
 ### main.py
@@ -174,19 +196,33 @@ four crop modes independently for both display and loopback output. Owns
 the pan/zoom state and emits `output_changed(pan_x, pan_y, zoom)` when the
 user drags or wheel-scrolls inside the canvas.
 
-**`_scan_video_devices()`** — runs `v4l2-ctl --list-devices`; falls back
-to globbing `/dev/video*` if v4l2-ctl is missing.
-
-**`_query_device_caps(dev)`** — runs `v4l2-ctl --list-formats-ext` for one
-device and returns a `{format: {label, sizes: {(w, h): [fps, …]}}}` dict.
+**`_scan_video_devices()`** / **`_query_device_caps(dev)`** — dispatch per OS.
+On Linux they run `v4l2-ctl --list-devices` / `--list-formats-ext` (with a
+`/dev/video*` glob fallback). On Windows they parse ffmpeg's DirectShow output
+(`-list_devices` / `-list_options`), returning the same
+`[(label, id), …]` and `{format: {label, sizes: {(w, h): [fps, …]}}}` shapes so
+the UI is platform-agnostic. Devices are addressed by friendly name (falling
+back to the stable `@device_pnp_…` alternative name when a name is ambiguous).
 
 ### audio.py
 
-**`_scan_audio_devices()`** — prefers `pactl list sources` (works under
-PipeWire); falls back to `arecord -l` for direct ALSA addressing. Returns
-`[(display_label, ffmpeg_address), …]`.
+**`_scan_audio_devices()`** — dispatches per OS. Linux prefers `pactl list
+sources` (works under PipeWire) and falls back to `arecord -l`; Windows parses
+ffmpeg's DirectShow audio device list. Returns `[(display_label,
+ffmpeg_address), …]`.
 
-### output.py
+### camera_controls.py (Windows)
+
+Windows image-controls backend, mirroring what `ui.py` does with `v4l2-ctl` on
+Linux. Talks to the capture device's DirectShow `IAMVideoProcAmp` interface via
+`comtypes` (pure Python — no native build). Public functions `available()`,
+`supported_controls(device_id)`, `set_control_percent(device_id, ctrl, pct)`,
+and `invalidate_cache()`. It maps the UI's 0–100 range onto each control's
+device-defined range and fails soft — if `comtypes` is missing or the device
+isn't matched, the sliders are simply disabled. Leaf module, no project-local
+imports (import-safe on Linux too).
+
+### output.py (Linux only)
 
 **`_find_loopback_devices()`** — walks `/sys/class/video4linux/` looking
 for nodes that expose the `max_openers` attribute (or have `v4l2loopback`
@@ -274,87 +310,119 @@ Tiny shared helpers used by `ui.py` and `output.py`:
 
 `ScreenWakeInhibitor` — keeps the display from dimming, blanking, or sleeping
 while the app is open, the same way a video player does. `MainWindow` calls
-`inhibit()` at startup and `release()` on close. It uses the freedesktop
-`org.freedesktop.ScreenSaver` D-Bus interface (honoured by GNOME, KDE and most
-desktops, X11 and Wayland), and falls back to `systemd-inhibit` if that call
-isn't available. If neither works it silently does nothing.
+`inhibit()` at startup and `release()` on close. The module splits at the top
+level by platform (so `PyQt6.QtDBus` is never imported on Windows). On Linux it
+uses the freedesktop `org.freedesktop.ScreenSaver` D-Bus interface (honoured by
+GNOME, KDE and most desktops, X11 and Wayland), falling back to
+`systemd-inhibit`. On Windows it calls the Win32 `SetThreadExecutionState`
+(`ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED`). Either way, if the
+mechanism is unavailable it silently does nothing.
 
 ---
 
 ## Dependencies
 
+### Shared (all platforms)
+
 | Dependency | Purpose | Check |
 |---|---|---|
-| Python ≥ 3.10 | `X \| Y` union hints, dataclasses | `python3 --version` |
-| PyQt6 | GUI framework | `python3 -c "import PyQt6"` |
-| numpy | Per-chunk RMS in AudioWorker | `python3 -c "import numpy"` |
-| ffmpeg | Video + audio capture pipelines | `which ffmpeg` |
+| Python ≥ 3.10 | `X \| Y` union hints, dataclasses | `python --version` |
+| PyQt6 | GUI framework | `python -c "import PyQt6"` |
+| numpy | Per-chunk RMS in AudioWorker | `python -c "import numpy"` |
+| ffmpeg | Video + audio capture pipelines | `ffmpeg -version` |
+
+### Linux only
+
+| Dependency | Purpose | Check |
+|---|---|---|
 | v4l2-ctl | Device enumeration + image controls | `which v4l2-ctl` |
 | arecord | ALSA capture device enumeration | `which arecord` |
 | pactl | Real-time volume control + PA module management | `which pactl` |
 | pacat | Pipe PCM into PulseAudio sink (virtual mic) | `which pacat` |
-| xdg-open | Open config folder button | `which xdg-open` |
 | v4l2loopback | Virtual camera device (optional) | `modinfo v4l2loopback` |
 
-Install missing Python packages:
+Install missing Python packages and system tools (Debian/Ubuntu):
 ```bash
 pip install PyQt6 numpy
-```
-
-Install system tools (Debian/Ubuntu):
-```bash
 sudo apt install ffmpeg v4l2-utils alsa-utils pulseaudio-utils
+sudo apt install v4l2loopback-dkms      # optional: virtual camera output
 ```
 
-For the virtual camera output feature:
-```bash
-sudo apt install v4l2loopback-dkms
+Config-folder opening and screen-wake use pure-Qt / D-Bus mechanisms — no
+`xdg-open` or extra tools required.
+
+### Windows only
+
+| Dependency | Purpose | Check |
+|---|---|---|
+| ffmpeg (on PATH) | DirectShow capture — **must be installed separately** | `ffmpeg -version` |
+| sounddevice | Audio passthrough playback (WASAPI) | `python -c "import sounddevice"` |
+| comtypes | UVC image controls via DirectShow `IAMVideoProcAmp` | `python -c "import comtypes"` |
+
+Install the Python packages (the `requirements.txt` markers pull the
+Windows-only ones automatically) and ffmpeg:
+```powershell
+pip install -r requirements.txt
+winget install -e --id Gyan.FFmpeg
 ```
 
-`xdg-open` is part of `xdg-utils`, usually pre-installed on desktop systems.
+ffmpeg is **not bundled** — the app checks for it on PATH at startup and shows
+the `winget` hint if it's missing. Device enumeration, capture, and image
+controls all use ffmpeg's DirectShow backend plus in-process COM, so no
+`v4l2-ctl` / PulseAudio equivalents are needed. See
+[Windows support & limitations](#windows-support--limitations) for what is and
+isn't available.
 
 ---
 
 ## Running the app
 
-There are three ways to run the app, in increasing order of formality:
-
 ### 1. From source (development)
 
 ```bash
-cd ~/Development/projects/hagibis-monitor
-python3 main.py
+python3 main.py      # Linux
+python main.py       # Windows
 ```
 
-Or press **F5** in VS Code (uses `.vscode/launch.json`). Requires the
-Python deps from the [Dependencies](#dependencies) section installed on
-your system (or in a venv) — there is no install step for this path.
+Or press **F5** in VS Code (uses `.vscode/launch.json`, which now relies on the
+interpreter you've selected in VS Code rather than a hardcoded path). Requires
+the Python deps from the [Dependencies](#dependencies) section installed on your
+system (or in a venv) — there is no install step for this path.
 
-### 2. Build a standalone binary — [`build.sh`](build.sh)
+### 2. Build a standalone binary — [`build.py`](build.py)
+
+The build is driven by one cross-platform script that detects the OS and
+produces the right artifact:
 
 ```bash
-./build.sh
+python build.py      # Windows or Linux
+./build.sh           # Linux convenience wrapper (calls build.py)
 ```
 
 What it does:
-- Creates (or reuses) an isolated build venv at `.venv-build/`.
-- Installs `pyinstaller`, `PyQt6`, and `numpy` into that venv only — your
-  system Python is not touched.
-- Runs `pyinstaller hagibis-monitor.spec --clean --noconfirm`, producing
-  a single-file executable at **`dist/hagibis-monitor`**.
+- Creates (or reuses) an isolated build venv at `.venv-build/` (using
+  `Scripts/` on Windows, `bin/` on Linux).
+- Installs `pyinstaller` and the deps from `requirements.txt` into that venv
+  only — your system Python is not touched.
+- Runs `pyinstaller hagibis-monitor.spec --clean --noconfirm`, producing a
+  single-file executable at **`dist/hagibis-monitor`** (Linux) or
+  **`dist\hagibis-monitor.exe`** (Windows).
 
-The resulting binary bundles Python, PyQt6, and numpy, so it runs on any
-glibc-compatible Linux without a Python install. It still needs the
-runtime system tools (`ffmpeg`, `v4l2-ctl`, `pactl`, `pacat`, etc. — see
-[Dependencies](#dependencies)).
+The Linux binary is UPX-compressed with a console (errors visible from a
+terminal); the Windows build is windowed (no console) and UPX-free (UPX trips
+antivirus and Control-Flow-Guard issues on Windows). Both bundle Python and all
+Python deps, but still need **ffmpeg** available at runtime (see
+[Dependencies](#dependencies)); the Windows build additionally has no app icon
+yet.
 
 Run it directly without installing:
 
 ```bash
-./dist/hagibis-monitor
+./dist/hagibis-monitor          # Linux
+.\dist\hagibis-monitor.exe      # Windows
 ```
 
-### 3. Install system-wide or per-user — [`install.sh`](install.sh)
+### 3. Install system-wide or per-user — [`install.sh`](install.sh) (Linux only)
 
 After `./build.sh` has produced `dist/hagibis-monitor`:
 
@@ -381,17 +449,60 @@ If `~/.local/bin` is not on your `PATH`, the installer reminds you to add it:
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-### 4. Pre-built release tarball
+### 4. Pre-built release archives
 
 If you'd rather not build locally, every push that bumps the version in
-[`.github/workflows/release.yml`](.github/workflows/release.yml) (and
-every manual workflow run) publishes a `hagibis-monitor-vX.Y.Z-linux-x86_64.tar.gz`
-to the project's GitHub Releases page. Extract it and run `./install.sh`
-from inside the extracted directory — same options as above.
+[`.github/workflows/release.yml`](.github/workflows/release.yml) (and every
+manual workflow run) publishes **two** archives to the project's GitHub Releases
+page:
+
+| Platform | Archive | How to run |
+|---|---|---|
+| Linux | `hagibis-monitor-vX.Y.Z-linux-x86_64.tar.gz` | Extract, then `./install.sh` from inside |
+| Windows | `hagibis-monitor-vX.Y.Z-windows-x86_64.zip` | Extract, ensure ffmpeg is on PATH, run `hagibis-monitor.exe` |
+
+The release is cut only after **both** platform builds succeed, so a version
+never ships with just one artifact.
 
 > **Note:** `hagibis-monitor.sh` in the repo root is **not** the app —
 > it's the original GStreamer one-liner that predated this project, kept
 > only for reference. Don't use it.
+
+---
+
+## Windows support & limitations
+
+Windows is supported for **live monitoring** since v1.3.0. The same one codebase
+runs on both platforms, branching only at OS-specific points (capture backend,
+device enumeration, image controls, screen-wake, settings path).
+
+**What works on Windows:**
+- Live video preview via ffmpeg's DirectShow (`dshow`) backend.
+- Device / format / resolution / frame-rate selection (enumerated from ffmpeg
+  `-list_devices` / `-list_options`).
+- Image controls (brightness / contrast / saturation / hue) via the device's
+  DirectShow `IAMVideoProcAmp` interface (using `comtypes`). Controls a given
+  device doesn't expose are disabled automatically.
+- Audio VU meters, mono mix, and **passthrough to your default output device**
+  (played by the app itself through `sounddevice`/WASAPI, since ffmpeg has no
+  audio-output device on Windows). Volume changes are instant.
+- Keep-screen-awake (Win32 `SetThreadExecutionState`).
+- Profiles and settings, stored under `%APPDATA%\HagibisMonitor\`.
+
+**What is Linux-only (not available on Windows):**
+- **Virtual camera output** — the Linux build streams to a `v4l2loopback`
+  device, which is a Linux kernel module with no Windows equivalent. The Output
+  tab shows an explanatory placeholder on Windows.
+- **Virtual microphone** — relies on PulseAudio null-sink + remap-source. On
+  Windows you'd install a third-party virtual audio cable; that is not wired up
+  in this release.
+
+**Other Windows notes:**
+- **ffmpeg must be on your PATH** — install with `winget install -e --id
+  Gyan.FFmpeg`. The app warns at startup if it's missing.
+- The executable is **unsigned**, so Windows SmartScreen may warn on first run
+  ("More info" → "Run anyway").
+- No custom app icon yet — the build uses PyInstaller's default.
 
 ---
 
@@ -739,12 +850,29 @@ in the status bar instead of silently capturing the wrong one.
 
 **Screen stays awake while open** — like a video player, the app inhibits the
 screensaver / display sleep for as long as it is open (via the desktop's
-`org.freedesktop.ScreenSaver` D-Bus service, or `systemd-inhibit` as a
-fallback), and releases it on close. This is session-wide: the screen stays on
-even if the window is minimized or the capture card is sending no signal. It is
-controlled by the **"Keep screen awake while running"** checkbox on the Video
-tab — a global setting (on by default) that applies to every profile, so
-switching profiles never changes it.
+`org.freedesktop.ScreenSaver` D-Bus service or `systemd-inhibit` on Linux, or
+`SetThreadExecutionState` on Windows), and releases it on close. This is
+session-wide: the screen stays on even if the window is minimized or the capture
+card is sending no signal. It is controlled by the **"Keep screen awake while
+running"** checkbox on the Video tab — a global setting (on by default) that
+applies to every profile, so switching profiles never changes it.
+
+**(Windows) ffmpeg must be on PATH** — Windows doesn't ship ffmpeg. Install it
+with `winget install -e --id Gyan.FFmpeg`; the app warns at startup if it's
+missing. The DirectShow device list is parsed from ffmpeg's stderr, whose
+log-line prefix varies by version (`[in#0 @ …]` on current builds, `[dshow @ …]`
+on older ones) — the parser anchors on a generic prefix to tolerate both.
+
+**(Windows) audio passthrough is played by the app** — ffmpeg has no audio
+*output* device on Windows, so captured audio is played to the default output
+device by the app itself (via `sounddevice`/WASAPI) using the same gained PCM
+that drives the VU meters. Volume changes therefore take effect instantly, with
+no separate volume-control machinery.
+
+**(Windows) duplicate capture-device names** — devices are addressed by their
+DirectShow friendly name, which survives replugging. If two devices share a
+name, the app falls back to the stable `@device_pnp_…` alternative name and
+shows the second as "Name #2".
 
 ---
 

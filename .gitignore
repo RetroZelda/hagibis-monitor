@@ -29,6 +29,7 @@ build/
 
 # Distribution / packaging
 *.tar.gz
+*.zip
 *.whl
 
 # pytest / coverage

@@ -1,4 +1,5 @@
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -8,9 +9,10 @@ from PyQt6.QtWidgets import (
     QTabWidget, QTabBar, QScrollArea, QSizePolicy, QFrame,
     QColorDialog, QInputDialog, QMessageBox, QLineEdit
 )
-from PyQt6.QtCore import Qt, QPoint, QSettings, QTimer
-from PyQt6.QtGui import QImage, QColor, QPalette
+from PyQt6.QtCore import Qt, QPoint, QSettings, QTimer, QUrl
+from PyQt6.QtGui import QImage, QColor, QPalette, QDesktopServices
 
+import camera_controls
 from workers import VideoWorker, AudioWorker, OutputWorker
 from vu_meter import StereoVuMeter
 from video import VideoDisplay, _scan_video_devices, _query_device_caps
@@ -20,7 +22,8 @@ from output import (
     _unload_v4l2loopback,
 )
 from settings import (
-    AppSettings, OutputSettings,
+    AppSettings, OutputSettings, IS_WINDOWS, global_qsettings,
+    _DEFAULT_VIDEO_DEVICE, _DEFAULT_AUDIO_DEVICE,
     _DEFAULT_FORMATS, _DEFAULT_RESOLUTIONS, _DEFAULT_FRAMERATES,
     _OUTPUT_RESOLUTIONS, _OUTPUT_PIXEL_FORMATS, _OUTPUT_FPS,
 )
@@ -50,6 +53,9 @@ class _StatusBar(QWidget):
         self.video_lbl = QLabel("○ Video", self._center)
         self.video_lbl.setStyleSheet("color: #888888;")
         row.addWidget(self.video_lbl)
+        # The output indicators track a Linux-only feature; hide the whole
+        # cluster on Windows so the signal text gets the full width.
+        self._center.setVisible(not IS_WINDOWS)
 
     def set_video_ref(self, ref: QWidget):
         self._video_ref = ref
@@ -68,6 +74,12 @@ class _StatusBar(QWidget):
 
         fps_w = self.fps_lbl.sizeHint().width() + 8
         self.fps_lbl.setGeometry(W - fps_w, 0, fps_w, H)
+
+        # When the output-indicator cluster is hidden (Windows), the signal text
+        # simply fills everything up to the FPS readout.
+        if not self._center.isVisible():
+            self.signal_lbl.setGeometry(4, 0, max(0, W - fps_w - 8), H)
+            return
 
         cw = self._center.sizeHint().width()
         if self._video_ref is not None and self._video_ref.isVisible():
@@ -113,6 +125,24 @@ class MainWindow(QMainWindow):
         self._apply_dark_theme()
         self._load_settings()
         self._apply_screen_wake(self._keep_awake.isChecked())
+        # ffmpeg is required at runtime on every platform; warn once (after the
+        # window is up) if it isn't on PATH.
+        QTimer.singleShot(0, self._check_ffmpeg)
+
+    def _check_ffmpeg(self):
+        if shutil.which("ffmpeg"):
+            return
+        if IS_WINDOWS:
+            detail = ("ffmpeg was not found on your PATH.\n\n"
+                      "Install it, then restart the app:\n"
+                      "    winget install -e --id Gyan.FFmpeg\n\n"
+                      "(or download a build from https://www.gyan.dev/ffmpeg/builds/ "
+                      "and add its bin folder to PATH).")
+        else:
+            detail = ("ffmpeg was not found on your PATH.\n\n"
+                      "Install it, then restart the app:\n"
+                      "    sudo apt install ffmpeg")
+        QMessageBox.warning(self, "ffmpeg not found", detail)
 
     # ── UI construction ───────────────────────────────────────────────────────
     def _build_ui(self):
@@ -201,7 +231,16 @@ class MainWindow(QMainWindow):
         tabs = QTabWidget()
         tabs.addTab(self._build_video_tab(), "Video")
         tabs.addTab(self._build_audio_tab(), "Audio")
-        tabs.addTab(self._build_output_tab(), "Output")
+        # The virtual camera/mic (v4l2loopback + PulseAudio) is Linux-only. Build
+        # the real Output widget tree regardless — ~15 methods reference its
+        # widgets and a profile re-saved on Windows must round-trip the output/
+        # pan/zoom fields — but on Windows show a placeholder tab instead of it.
+        self._output_tab = self._build_output_tab()
+        if IS_WINDOWS:
+            self._output_tab.setVisible(False)  # kept alive via this reference
+            tabs.addTab(self._build_output_stub_tab(), "Output")
+        else:
+            tabs.addTab(self._output_tab, "Output")
         panel_layout.addWidget(tabs)
         panel_layout.addStretch()
 
@@ -346,6 +385,8 @@ class MainWindow(QMainWindow):
         il.addWidget(reset_btn)
         layout.addWidget(img)
 
+        self._update_img_ctrl_availability()
+
         layout.addStretch()
         return w
 
@@ -393,7 +434,7 @@ class MainWindow(QMainWindow):
         ol.addWidget(self._mono_mix)
         self._passthrough = QCheckBox("Passthrough to System Audio")
         self._passthrough.setToolTip(
-            "Route captured audio to the default PulseAudio/PipeWire output."
+            "Route captured audio to the default system audio output."
         )
         self._passthrough.stateChanged.connect(self._on_audio_opt_change)
         ol.addWidget(self._passthrough)
@@ -606,6 +647,26 @@ class MainWindow(QMainWindow):
         layout.addStretch()
         return w
 
+    def _build_output_stub_tab(self) -> QWidget:
+        """Placeholder shown on the Output tab on Windows, where the virtual
+        camera/mic backends (v4l2loopback + PulseAudio) don't exist."""
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(12, 12, 12, 12)
+        note = QLabel(
+            "Virtual camera and virtual microphone output is not available on "
+            "Windows yet.\n\n"
+            "On Linux, this tab streams the processed video to a v4l2loopback "
+            "virtual camera and creates a virtual microphone that OBS, Discord "
+            "and similar apps can capture."
+        )
+        note.setWordWrap(True)
+        note.setAlignment(Qt.AlignmentFlag.AlignTop)
+        note.setStyleSheet("color: #999999;")
+        layout.addWidget(note)
+        layout.addStretch()
+        return w
+
     # ── theming ───────────────────────────────────────────────────────────────
     def _apply_dark_theme(self):
         app = QApplication.instance()
@@ -664,7 +725,7 @@ class MainWindow(QMainWindow):
 
     # ── profile file helpers ──────────────────────────────────────────────────
     def _profiles_dir(self) -> Path:
-        ini = QSettings("HagibisMonitor", "HagibisMonitor").fileName()
+        ini = global_qsettings().fileName()
         return Path(ini).parent / "profiles"
 
     def _profile_path(self, name: str) -> Path:
@@ -675,8 +736,9 @@ class MainWindow(QMainWindow):
         return QSettings(str(self._profile_path(name)), QSettings.Format.IniFormat)
 
     def _open_config_folder(self):
-        subprocess.Popen(["xdg-open", str(self._profiles_dir())],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        d = self._profiles_dir()
+        d.mkdir(parents=True, exist_ok=True)  # openUrl fails on a missing path
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(d)))
 
     def _list_profiles(self) -> list[str]:
         d = self._profiles_dir()
@@ -701,7 +763,7 @@ class MainWindow(QMainWindow):
             scale_mode    = self._scale_combo.currentData() or "fit",
             crop_mode     = self._crop_combo.currentData() or "full",
             bg_color      = self._display._bg_color.name(),
-            video_device  = self._device_combo.currentData() or "/dev/video0",
+            video_device  = self._device_combo.currentData() or _DEFAULT_VIDEO_DEVICE,
             video_fmt     = self._fmt_combo.currentData() or "mjpeg",
             video_res     = f"{w}x{h}",
             video_fps     = self._fps_combo.currentData() or 30,
@@ -709,7 +771,7 @@ class MainWindow(QMainWindow):
             contrast      = self._v4l2_sliders["contrast"].value(),
             saturation    = self._v4l2_sliders["saturation"].value(),
             hue           = self._v4l2_sliders["hue"].value(),
-            audio_device  = self._audio_device_combo.currentData() or "plughw:Hagibis,0",
+            audio_device  = self._audio_device_combo.currentData() or _DEFAULT_AUDIO_DEVICE,
             audio_enabled = self._audio_enabled.isChecked(),
             mono_mix      = self._mono_mix.isChecked(),
             passthrough   = self._passthrough.isChecked(),
@@ -739,8 +801,8 @@ class MainWindow(QMainWindow):
             v = s.value(key)
             return v if v is not None else default
 
-        dev = _s("cap/device", "/dev/video0")
-        adev = _s("audio/device", "plughw:Hagibis,0")
+        dev = _s("cap/device", _DEFAULT_VIDEO_DEVICE)
+        adev = _s("audio/device", _DEFAULT_AUDIO_DEVICE)
 
         # Support the old per-device-keyed format for migration
         dk = _dev_key(dev)
@@ -846,7 +908,7 @@ class MainWindow(QMainWindow):
 
         # Video device
         video_found = self._select_combo_by_data(self._device_combo, settings.video_device)
-        actual_video_dev = self._device_combo.currentData() or "/dev/video0"
+        actual_video_dev = self._device_combo.currentData() or _DEFAULT_VIDEO_DEVICE
 
         # Caps + format/res/fps combos — query the device actually selected, not
         # the saved one, so an unplugged card doesn't populate mismatched combos.
@@ -922,17 +984,20 @@ class MainWindow(QMainWindow):
         # Restart streams
         self._restart_video()
         self._apply_v4l2_all()
+        self._update_img_ctrl_availability()
         if settings.audio_enabled:
             self._start_audio()
         else:
             self._stop_audio()
 
         # Warn (last, so it isn't overwritten by the "Capturing…" message) if a
-        # saved device is gone and we silently fell back to another one.
+        # saved device is gone and we silently fell back to another one. An empty
+        # saved value means "auto / first available" (the Windows default), so it
+        # never warns.
         missing = []
-        if not video_found:
+        if settings.video_device and not video_found:
             missing.append(f"video device {settings.video_device}")
-        if not audio_found:
+        if settings.audio_device and not audio_found:
             missing.append(f"audio device {settings.audio_device}")
         if missing:
             self._lbl_signal.setText("⚠ Saved " + " and ".join(missing) +
@@ -1035,7 +1100,7 @@ class MainWindow(QMainWindow):
 
     def _switch_profile(self, name: str):
         self._current_profile = name
-        QSettings("HagibisMonitor", "HagibisMonitor").setValue("profile/current", name)
+        global_qsettings().setValue("profile/current", name)
         self._del_profile_btn.setEnabled(name != "Default")
         settings = self._load_from_disk(name)
         self._apply_settings(settings)
@@ -1046,7 +1111,7 @@ class MainWindow(QMainWindow):
 
     def _save_profile(self):
         self._save_to_disk(self._collect_settings(), self._current_profile)
-        QSettings("HagibisMonitor", "HagibisMonitor").setValue(
+        global_qsettings().setValue(
             "profile/current", self._current_profile
         )
         self._clear_dirty()
@@ -1073,7 +1138,7 @@ class MainWindow(QMainWindow):
         self._current_profile = name
         self._populate_profile_combo()
         self._clear_dirty()
-        QSettings("HagibisMonitor", "HagibisMonitor").setValue("profile/current", name)
+        global_qsettings().setValue("profile/current", name)
 
     def _delete_profile(self):
         name = self._current_profile
@@ -1087,7 +1152,7 @@ class MainWindow(QMainWindow):
 
     # ── global settings (window geometry + active profile only) ───────────────
     def _load_settings(self):
-        gs = QSettings("HagibisMonitor", "HagibisMonitor")
+        gs = global_qsettings()
         geom = gs.value("window/geometry")
         if geom:
             self.restoreGeometry(geom)
@@ -1124,7 +1189,7 @@ class MainWindow(QMainWindow):
         self._display.output_changed.connect(self._on_output_changed)
 
     def _save_global(self):
-        gs = QSettings("HagibisMonitor", "HagibisMonitor")
+        gs = global_qsettings()
         gs.setValue("window/geometry",     self.saveGeometry())
         gs.setValue("window/state",        self.saveState())
         gs.setValue("window/panel_visible", self._panel_scroll.isVisible())
@@ -1134,7 +1199,7 @@ class MainWindow(QMainWindow):
     # ── screen-wake (global setting) ──────────────────────────────────────────
     def _on_keep_awake_changed(self, state: int):
         enabled = state == Qt.CheckState.Checked.value
-        QSettings("HagibisMonitor", "HagibisMonitor").setValue("power/keep_awake", enabled)
+        global_qsettings().setValue("power/keep_awake", enabled)
         self._apply_screen_wake(enabled)
 
     def _apply_screen_wake(self, enabled: bool):
@@ -1253,13 +1318,15 @@ class MainWindow(QMainWindow):
 
     # ── video device ──────────────────────────────────────────────────────────
     def _on_video_device_changed(self):
-        dev = self._device_combo.currentData() or "/dev/video0"
+        dev = self._device_combo.currentData() or _DEFAULT_VIDEO_DEVICE
         self._caps = _query_device_caps(dev)
         self._populate_fmt_combo()
+        self._update_img_ctrl_availability()
         self._mark_dirty()
 
     def _refresh_video_devices(self):
         current = self._device_combo.currentData()
+        camera_controls.invalidate_cache()  # device set may have changed
         self._video_devices = _scan_video_devices()
         self._device_combo.blockSignals(True)
         self._device_combo.clear()
@@ -1267,17 +1334,21 @@ class MainWindow(QMainWindow):
             self._device_combo.addItem(label, path)
         self._select_combo_by_data(self._device_combo, current)
         self._device_combo.blockSignals(False)
+        self._update_img_ctrl_availability()
 
     # ── capture params + video management ────────────────────────────────────
     def _cap_params(self) -> tuple[int, int, int, str, str]:
         w, h = self._res_combo.currentData() or (1280, 720)
         fps  = self._fps_combo.currentData() or 30
         fmt  = self._fmt_combo.currentData() or "mjpeg"
-        dev  = self._device_combo.currentData() or "/dev/video0"
+        dev  = self._device_combo.currentData() or _DEFAULT_VIDEO_DEVICE
         return w, h, fps, fmt, dev
 
     def _start_video(self):
         w, h, fps, fmt, dev = self._cap_params()
+        if not dev:
+            self._lbl_signal.setText("No video capture device found — click ↻ to rescan")
+            return
         wk = VideoWorker()
         wk.configure(w, h, fps, fmt, dev)
         # One slot handles both the preview and the output feed, then tells the
@@ -1312,11 +1383,17 @@ class MainWindow(QMainWindow):
 
     # ── V4L2 controls ─────────────────────────────────────────────────────────
     def _set_v4l2(self, ctrl: str, value: int):
-        dev = self._device_combo.currentData() or "/dev/video0"
-        subprocess.Popen(
-            ["v4l2-ctl", "-d", dev, f"--set-ctrl={ctrl}={value}"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
+        dev = self._device_combo.currentData() or _DEFAULT_VIDEO_DEVICE
+        if IS_WINDOWS:
+            camera_controls.set_control_percent(dev, ctrl, value)
+        else:
+            try:
+                subprocess.Popen(
+                    ["v4l2-ctl", "-d", dev, f"--set-ctrl={ctrl}={value}"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+            except FileNotFoundError:
+                pass  # v4l2-utils not installed; sliders are effectively inert
         self._mark_dirty()
 
     def _reset_v4l2(self):
@@ -1324,12 +1401,33 @@ class MainWindow(QMainWindow):
             slider.setValue(50)
 
     def _apply_v4l2_all(self):
-        dev = self._device_combo.currentData() or "/dev/video0"
+        dev = self._device_combo.currentData() or _DEFAULT_VIDEO_DEVICE
         for ctrl, slider in self._v4l2_sliders.items():
-            subprocess.Popen(
-                ["v4l2-ctl", "-d", dev, f"--set-ctrl={ctrl}={slider.value()}"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
+            if IS_WINDOWS:
+                camera_controls.set_control_percent(dev, ctrl, slider.value())
+            else:
+                try:
+                    subprocess.Popen(
+                        ["v4l2-ctl", "-d", dev, f"--set-ctrl={ctrl}={slider.value()}"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    )
+                except FileNotFoundError:
+                    pass
+
+    def _update_img_ctrl_availability(self):
+        """Enable/disable the image-control sliders based on device support.
+
+        Linux sliders are always enabled (v4l2-ctl handles any device); on
+        Windows a slider is only usable if the matched DirectShow device exposes
+        that IAMVideoProcAmp control."""
+        if not IS_WINDOWS:
+            return
+        dev = self._device_combo.currentData() or ""
+        supported = camera_controls.supported_controls(dev) if dev else set()
+        for ctrl, slider in self._v4l2_sliders.items():
+            ok = ctrl in supported
+            slider.setEnabled(ok)
+            slider.setToolTip("" if ok else "Unavailable on this device")
 
     # ── audio device ──────────────────────────────────────────────────────────
     def _on_audio_device_changed(self):
@@ -1350,11 +1448,15 @@ class MainWindow(QMainWindow):
     # ── audio management ──────────────────────────────────────────────────────
     def _start_audio(self):
         self._stop_audio()
+        dev = self._audio_device_combo.currentData() or _DEFAULT_AUDIO_DEVICE
+        if not dev:
+            return  # no audio device enumerated yet (Windows "auto" with none present)
         wk = AudioWorker()
-        wk.device          = self._audio_device_combo.currentData() or "plughw:Hagibis,0"
+        wk.device          = dev
         wk.mono_mix        = self._mono_mix.isChecked()
         wk.passthrough     = self._passthrough.isChecked()
-        wk.virtual_output  = self._out_enabled.isChecked()
+        # Virtual mic is Linux-only; never enable it on Windows.
+        wk.virtual_output  = self._out_enabled.isChecked() and not IS_WINDOWS
         wk.volume_db       = self._vol_slider.value()
         wk.volume_l_db     = self._vol_l_slider.value()
         wk.volume_r_db     = self._vol_r_slider.value()
@@ -1362,11 +1464,15 @@ class MainWindow(QMainWindow):
         wk.error.connect(lambda e: self._lbl_signal.setText(f"Audio error: {e}"))
         self._audio_worker = wk
         wk.start()
-        self._pa_sink_input = None
-        self._pa_poll_count = 0
-        QTimer.singleShot(80, self._poll_pa_sink_input)
-        if wk.virtual_output:
-            QTimer.singleShot(500, self._apply_virtual_source_volume)
+        # PulseAudio sink-input volume polling is Linux-only. On Windows the
+        # passthrough level is applied Python-side inside AudioWorker (the same
+        # gain used for the VU meters), so no polling is needed.
+        if not IS_WINDOWS:
+            self._pa_sink_input = None
+            self._pa_poll_count = 0
+            QTimer.singleShot(80, self._poll_pa_sink_input)
+            if wk.virtual_output:
+                QTimer.singleShot(500, self._apply_virtual_source_volume)
         self._update_output_status()
 
     def _stop_audio(self, teardown_virtual: bool = False):
@@ -1442,6 +1548,13 @@ class MainWindow(QMainWindow):
 
     def _on_out_enable_changed(self, state: int):
         enabled = state == Qt.CheckState.Checked.value
+        if IS_WINDOWS and enabled:
+            # Output has no Windows backend; bounce the checkbox back off. (The
+            # Output tab is a placeholder here, so this is belt-and-braces.)
+            self._out_enabled.blockSignals(True)
+            self._out_enabled.setChecked(False)
+            self._out_enabled.blockSignals(False)
+            return
         if enabled:
             selected = self._output_video_combo.currentData() or ""
             # Only reuse the selected device if it still exists; a previous
@@ -1526,6 +1639,8 @@ class MainWindow(QMainWindow):
     # ── output stream management ──────────────────────────────────────────────
 
     def _start_output(self):
+        if IS_WINDOWS:
+            return  # no v4l2loopback backend on Windows
         self._stop_output()
         dev = self._v4l2_device
         if not dev:
@@ -1582,7 +1697,8 @@ class MainWindow(QMainWindow):
             v = gs.value(f"output/{k}"); return v if v is not None else d
 
         self._output_settings = OutputSettings(
-            enabled      = _b("enabled",      False),
+            # Output has no Windows backend — never start it enabled there.
+            enabled      = _b("enabled",      False) and not IS_WINDOWS,
             device       = _s("device",       ""),
             width        = _i("width",         1920),
             height       = _i("height",        1080),
@@ -1610,7 +1726,8 @@ class MainWindow(QMainWindow):
             self._fill_out_res_combo()
             self._select_combo_by_data(self._out_res_combo, (os.width, os.height))
 
-        self._populate_output_video_combo(os.device)
+        if not IS_WINDOWS:
+            self._populate_output_video_combo(os.device)
         self._select_combo(self._out_pix_fmt_combo, os.pixel_format)
         self._select_combo_by_data(self._out_fps_combo, os.fps)
 
@@ -1620,8 +1737,9 @@ class MainWindow(QMainWindow):
 
         # Restore the enabled state, but only when the saved loopback device is
         # already present — auto-enabling otherwise would fire a modprobe/pkexec
-        # prompt at launch, which the user didn't ask for.
-        if os.enabled and os.device and os.device in _find_loopback_devices():
+        # prompt at launch, which the user didn't ask for. (Never on Windows,
+        # which has no loopback backend.)
+        if not IS_WINDOWS and os.enabled and os.device and os.device in _find_loopback_devices():
             self._out_enabled.setChecked(True)  # unblocked → enables via existing device
 
     def _save_output_settings(self):
@@ -1629,7 +1747,7 @@ class MainWindow(QMainWindow):
         # Fall back to the combo's device so disabling output (which clears
         # _v4l2_device) doesn't erase the remembered device.
         device = self._v4l2_device or (self._output_video_combo.currentData() or "")
-        gs = QSettings("HagibisMonitor", "HagibisMonitor")
+        gs = global_qsettings()
         gs.setValue("output/enabled",      self._out_enabled.isChecked())
         gs.setValue("output/device",       device)
         gs.setValue("output/width",        w)
@@ -1682,7 +1800,7 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(80, self._poll_pa_sink_input)
 
     def _find_pa_sink_input(self) -> int | None:
-        if not self._audio_worker:
+        if IS_WINDOWS or not self._audio_worker:
             return None
         pid = self._audio_worker.proc_pid
         if pid is None:
@@ -1704,28 +1822,36 @@ class MainWindow(QMainWindow):
         return None
 
     def _apply_pa_volume(self):
-        if self._pa_sink_input is None or not self._passthrough.isChecked():
+        # Linux-only: Windows applies passthrough volume Python-side in the
+        # AudioWorker gain path (the same gain used for the VU meters).
+        if IS_WINDOWS or self._pa_sink_input is None or not self._passthrough.isChecked():
             return
         master = self._vol_slider.value()
         l_pct = max(0, int(100 * 10 ** ((master + self._vol_l_slider.value()) / 20.0)))
         r_pct = max(0, int(100 * 10 ** ((master + self._vol_r_slider.value()) / 20.0)))
-        subprocess.Popen(
-            ["pactl", "set-sink-input-volume", str(self._pa_sink_input),
-             f"{l_pct}%", f"{r_pct}%"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
+        try:
+            subprocess.Popen(
+                ["pactl", "set-sink-input-volume", str(self._pa_sink_input),
+                 f"{l_pct}%", f"{r_pct}%"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except FileNotFoundError:
+            pass
 
     def _apply_virtual_source_volume(self):
-        if not self._out_enabled.isChecked():
+        if IS_WINDOWS or not self._out_enabled.isChecked():
             return
         master = self._vol_slider.value()
         l_pct = max(0, int(100 * 10 ** ((master + self._vol_l_slider.value()) / 20.0)))
         r_pct = max(0, int(100 * 10 ** ((master + self._vol_r_slider.value()) / 20.0)))
-        subprocess.Popen(
-            ["pactl", "set-sink-volume", AudioWorker.BUS_SINK,
-             f"{l_pct}%", f"{r_pct}%"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
+        try:
+            subprocess.Popen(
+                ["pactl", "set-sink-volume", AudioWorker.BUS_SINK,
+                 f"{l_pct}%", f"{r_pct}%"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except FileNotFoundError:
+            pass
 
     # ── panel toggle ──────────────────────────────────────────────────────────
     def _toggle_panel(self):

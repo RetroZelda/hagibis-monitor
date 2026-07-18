@@ -1,13 +1,42 @@
 import glob
 import re
 import subprocess
+import sys
+from collections import Counter
 
 from PyQt6.QtCore import Qt, QPoint, QRect, QRectF, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import QLabel, QSizePolicy
 
+_IS_WINDOWS = sys.platform == "win32"
+# Suppress the transient console window each ffmpeg spawn would otherwise flash
+# under the windowed (console=False) Windows build.
+_NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if _IS_WINDOWS else {}
+
+# DirectShow parsing regexes (Windows). ffmpeg's log-line prefix varies by
+# version — current builds print "[in#0 @ 0x..]", older ones "[dshow @ 0x..]" —
+# so anchor on a generic "[...]" prefix, never the literal "dshow".
+_DSHOW_DEV_RE  = re.compile(r'^\[[^\]]+\]\s+"(?P<name>.+)"\s+\((?P<types>[^)]*)\)\s*$')
+_DSHOW_ALT_RE  = re.compile(r'^\[[^\]]+\]\s+Alternative name\s+"(?P<alt>.+)"\s*$')
+_DSHOW_MODE_RE = re.compile(
+    r'(?P<kind>vcodec|pixel_format)=(?P<val>\w+)\s+'
+    r'min s=(?P<minw>\d+)x(?P<minh>\d+) fps=(?P<minfps>[\d.]+)\s+'
+    r'max s=(?P<maxw>\d+)x(?P<maxh>\d+) fps=(?P<maxfps>[\d.]+)')
+# Discrete framerates offered in the UI, intersected with each mode's reported
+# [min, max] fps range (the ceiling is always added on top).
+_WIN_FPS_CANDIDATES = (60, 50, 30, 25, 20, 15, 10)
+
 
 def _scan_video_devices() -> list[tuple[str, str]]:
+    return _scan_video_devices_windows() if _IS_WINDOWS else _scan_video_devices_linux()
+
+
+def _query_device_caps(dev: str) -> dict:
+    return _query_device_caps_windows(dev) if _IS_WINDOWS else _query_device_caps_linux(dev)
+
+
+# ── Linux (V4L2) ──────────────────────────────────────────────────────────────
+def _scan_video_devices_linux() -> list[tuple[str, str]]:
     try:
         out = subprocess.check_output(
             ["v4l2-ctl", "--list-devices"], stderr=subprocess.DEVNULL, timeout=2,
@@ -25,7 +54,7 @@ def _scan_video_devices() -> list[tuple[str, str]]:
         return [(p, p) for p in paths] or [("/dev/video0", "/dev/video0")]
 
 
-def _query_device_caps(dev: str) -> dict:
+def _query_device_caps_linux(dev: str) -> dict:
     FMT_MAP = {"MJPG": ("mjpeg", "MJPEG"), "YUY2": ("yuyv422", "YUYV")}
     caps: dict = {}
     try:
@@ -56,6 +85,96 @@ def _query_device_caps(dev: str) -> dict:
         m = re.match(r"Interval: Discrete .+\((\d+\.\d+) fps\)", line)
         if m and current_fmt and current_size:
             caps[current_fmt]["sizes"][current_size].append(round(float(m.group(1))))
+    return caps
+
+
+# ── Windows (DirectShow via ffmpeg) ───────────────────────────────────────────
+def _list_dshow_devices(kind: str) -> list[tuple[str, str]]:
+    """Return [(friendly_name, alternative_name)] for dshow devices of `kind`
+    ("video" or "audio"). alternative_name is "" if none was printed.
+
+    ffmpeg emits the device list to stderr and always exits non-zero on the
+    "dummy" open, so parse stderr regardless of return code. Third-party driver
+    logging (e.g. NVIDIA Broadcast) is interleaved and simply doesn't match the
+    device/alt-name regexes. (audio.py shares this parser via kind="audio".)
+    """
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
+            capture_output=True, timeout=10, **_NO_WINDOW,
+        )
+        text = r.stderr.decode(errors="replace")
+    except Exception:
+        return []
+    out: list[list[str] | None] = []
+    for line in text.splitlines():
+        m = _DSHOW_DEV_RE.match(line)
+        if m:
+            types = {t.strip() for t in m["types"].split(",")}
+            # Keep a slot (matching kind) or a None placeholder, so a following
+            # Alternative-name line only ever attaches to the device above it.
+            out.append([m["name"], ""] if kind in types else None)
+            continue
+        m = _DSHOW_ALT_RE.match(line)
+        if m and out and out[-1] is not None and out[-1][1] == "":
+            out[-1][1] = m["alt"]
+    return [(e[0], e[1]) for e in out if e is not None]
+
+
+def _apply_duplicate_name_policy(entries: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Map [(friendly, alt)] to [(display, device_id)].
+
+    Prefer the friendly name as the stored id (human-readable in profile INIs,
+    survives replug — mirrors the Linux `plughw:Name` decision). Fall back to
+    the stable @device alternative name only when a friendly name is ambiguous
+    (appears more than once), displaying it as "Name #N".
+    """
+    counts = Counter(name for name, _ in entries)
+    seen: Counter = Counter()
+    devices: list[tuple[str, str]] = []
+    for name, alt in entries:
+        if counts[name] > 1 and alt:
+            seen[name] += 1
+            devices.append((f"{name} #{seen[name]}", alt))
+        else:
+            devices.append((name, name))
+    return devices
+
+
+def _scan_video_devices_windows() -> list[tuple[str, str]]:
+    # No fake fallback row on Windows — an empty list means "no camera", which
+    # ui.py surfaces as a rescan hint rather than a bogus /dev/video0 entry.
+    return _apply_duplicate_name_policy(_list_dshow_devices("video"))
+
+
+def _query_device_caps_windows(dev: str) -> dict:
+    FMT_MAP = {("vcodec", "mjpeg"):         ("mjpeg",   "MJPEG"),
+               ("pixel_format", "yuyv422"): ("yuyv422", "YUYV")}
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-list_options", "true", "-f", "dshow",
+             "-i", f"video={dev}"],
+            capture_output=True, timeout=10, **_NO_WINDOW,
+        )
+        text = r.stderr.decode(errors="replace")
+    except Exception:
+        return {}
+    caps: dict = {}
+    for m in _DSHOW_MODE_RE.finditer(text):
+        key = (m["kind"], m["val"])
+        if key not in FMT_MAP:
+            continue  # nv12 etc. skipped, same intent as the Linux FMT_MAP
+        ff, label = FMT_MAP[key]
+        size = (int(m["maxw"]), int(m["maxh"]))  # min s == max s for discrete UVC modes
+        minf, maxf = float(m["minfps"]), round(float(m["maxfps"]))  # 60.0002 → 60
+        fps = {f for f in _WIN_FPS_CANDIDATES if minf <= f <= maxf}
+        fps.add(maxf)  # always offer the reported ceiling
+        entry = caps.setdefault(ff, {"label": label, "sizes": {}})
+        # set() dedups the doubled mode lines (plain + "(tv, …)" suffix).
+        entry["sizes"].setdefault(size, set()).update(fps)
+    # Convert the fps sets to the sorted-list shape ui.py's combos expect.
+    for entry in caps.values():
+        entry["sizes"] = {sz: sorted(fl, reverse=True) for sz, fl in entry["sizes"].items()}
     return caps
 
 
