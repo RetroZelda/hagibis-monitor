@@ -299,19 +299,25 @@ class VideoDisplay(QLabel):
     def _refresh_normal(self, W: int, H: int):
         self._render_target = None
         px   = self._cropped(self._pixmap)
-        fast = Qt.TransformationMode.FastTransformation
+        # Bilinear, not nearest-neighbour: downscaling a 1080p/4K frame to the
+        # preview window with FastTransformation looks blocky/pixelated, while
+        # SmoothTransformation matches what OBS (and our own loopback output)
+        # show. It's one scale per displayed frame; frame backpressure
+        # (VideoWorker.MAX_INFLIGHT) keeps this from adding latency.
+        smooth = Qt.TransformationMode.SmoothTransformation
         mode = self._scale_mode
 
         if mode == "stretch":
-            self._render_px = px.scaled(W, H, Qt.AspectRatioMode.IgnoreAspectRatio, fast)
+            self._render_px = px.scaled(W, H, Qt.AspectRatioMode.IgnoreAspectRatio, smooth)
             self._render_pt = QPoint(0, 0)
         elif mode == "fill":
-            s = px.scaled(W, H, Qt.AspectRatioMode.KeepAspectRatioByExpanding, fast)
+            s = px.scaled(W, H, Qt.AspectRatioMode.KeepAspectRatioByExpanding, smooth)
             self._render_px = s.copy(
                 max(0, (s.width() - W) // 2), max(0, (s.height() - H) // 2), W, H
             )
             self._render_pt = QPoint(0, 0)
         elif mode == "native":
+            # 1:1 pixels — deliberately no scaling, so no transform quality knob.
             self._render_px = px
             self._render_pt = QPoint(max(0, (W - px.width()) // 2),
                                      max(0, (H - px.height()) // 2))
@@ -319,17 +325,17 @@ class VideoDisplay(QLabel):
             rw, rh = (int(v) for v in mode[5:].split("_"))
             scale  = min(W / rw, H / rh)
             aw, ah = int(rw * scale), int(rh * scale)
-            s = px.scaled(aw, ah, Qt.AspectRatioMode.KeepAspectRatio, fast)
+            s = px.scaled(aw, ah, Qt.AspectRatioMode.KeepAspectRatio, smooth)
             self._render_px = s
             self._render_pt = QPoint((W - s.width()) // 2, (H - s.height()) // 2)
         elif mode.startswith("stretch_"):
             rw, rh = (int(v) for v in mode[8:].split("_"))
             scale  = min(W / rw, H / rh)
             aw, ah = int(rw * scale), int(rh * scale)
-            self._render_px = px.scaled(aw, ah, Qt.AspectRatioMode.IgnoreAspectRatio, fast)
+            self._render_px = px.scaled(aw, ah, Qt.AspectRatioMode.IgnoreAspectRatio, smooth)
             self._render_pt = QPoint((W - aw) // 2, (H - ah) // 2)
         else:  # "fit"
-            s = px.scaled(W, H, Qt.AspectRatioMode.KeepAspectRatio, fast)
+            s = px.scaled(W, H, Qt.AspectRatioMode.KeepAspectRatio, smooth)
             self._render_px = s
             self._render_pt = QPoint((W - s.width()) // 2, (H - s.height()) // 2)
 

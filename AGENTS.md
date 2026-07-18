@@ -442,6 +442,13 @@ class AppSettings:
 - **`paintEvent` rendering in `VideoDisplay`** — `setPixmap` can only fill
   the full label bounds; using `QPainter.drawPixmap` at a computed `QPoint`
   allows area-constrained scale modes with background colour filling the rest.
+- **Smooth preview scaling** — `_refresh_normal` scales each frame with
+  `Qt.SmoothTransformation` (bilinear), not `FastTransformation`
+  (nearest-neighbour). Nearest-neighbour made a downscaled 1080p/4K preview look
+  blocky/pixelated versus what OBS (and the loopback output, which already used
+  `SmoothPixmapTransform`) show. It's one scale per displayed frame; the
+  `MAX_INFLIGHT` backpressure means the extra cost can only trim framerate on
+  weak hardware, never add latency. `native` (1:1) mode still does no scaling.
 - **Frame backpressure (`VideoWorker.MAX_INFLIGHT`)** — the worker deep-copies a
   full RGB frame per `frame_ready` emit, delivered cross-thread (queued) to the
   GUI. Without a bound, a GUI slower than the capture rate piles frame copies in

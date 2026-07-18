@@ -7,7 +7,16 @@
             "request": "launch",
             "program": "${workspaceFolder}/main.py",
             "console": "integratedTerminal",
-            "justMyCode": true
+            "justMyCode": true,
+            "windows": {
+                "python": "${workspaceFolder}\\.venv\\Scripts\\python.exe"
+            },
+            "linux": {
+                "python": "${workspaceFolder}/.venv/bin/python"
+            },
+            "osx": {
+                "python": "${workspaceFolder}/.venv/bin/python"
+            }
         }
     ]
 }

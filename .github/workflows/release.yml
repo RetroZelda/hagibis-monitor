@@ -6,9 +6,9 @@ on:
       # NOTE: this must stay the FIRST `default:` line in the file — the push
       # trigger below greps the first `default: 'X.Y.Z'` as the release version.
       version:
-        description: 'Release version — omit the "v" prefix (e.g. 1.3.0). Check the previous tag shown in the first step if unsure. Version numbering should be "{major}.{minor}.{patch}" and follow semver principles. This will be used as the release tag and in the archive name, so choose carefully and sequentially!'
+        description: 'Release version — omit the "v" prefix (e.g. 1.3.1). Check the previous tag shown in the first step if unsure. Version numbering should be "{major}.{minor}.{patch}" and follow semver principles. This will be used as the release tag and in the archive name, so choose carefully and sequentially!'
         required: true
-        default: '1.3.0'
+        default: '1.3.1'
   push:
     branches:
       - main
