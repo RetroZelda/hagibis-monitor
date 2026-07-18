@@ -3,10 +3,12 @@ name: Build & Release
 on:
   workflow_dispatch:
     inputs:
+      # NOTE: this must stay the FIRST `default:` line in the file — the push
+      # trigger below greps the first `default: 'X.Y.Z'` as the release version.
       version:
-        description: 'Release version — omit the "v" prefix (e.g. 1.2.0). Check the previous tag shown in the first step if unsure. Version numbering should be "{major}.{minor}.{patch}" and follow semver principles. This will be used as the release tag and in the archive name, so choose carefully and sequentially!'
+        description: 'Release version — omit the "v" prefix (e.g. 1.3.0). Check the previous tag shown in the first step if unsure. Version numbering should be "{major}.{minor}.{patch}" and follow semver principles. This will be used as the release tag and in the archive name, so choose carefully and sequentially!'
         required: true
-        default: '1.2.0'
+        default: '1.3.0'
   push:
     branches:
       - main
@@ -15,9 +17,12 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  # ── resolve version + skip decision once, on Linux ──────────────────────────
+  resolve:
     runs-on: ubuntu-latest
-
+    outputs:
+      tag:  ${{ steps.ver.outputs.tag }}
+      skip: ${{ steps.ver.outputs.skip }}
     steps:
       - name: Restrict to authorized user
         if: github.actor != 'retrozelda'
@@ -75,13 +80,28 @@ jobs:
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
+  # ── build both platforms; a failure in either leg cancels the sibling ───────
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.skip != 'true'
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: linux
+          - os: windows-latest
+            artifact: windows
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
-        if: steps.ver.outputs.skip != 'true'
         with:
           python-version: '3.11'
 
-      - name: Install system dependencies
-        if: steps.ver.outputs.skip != 'true'
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update -q
           sudo apt-get install -y \
@@ -98,31 +118,57 @@ jobs:
             upx-ucl
 
       - name: Install Python dependencies
-        if: steps.ver.outputs.skip != 'true'
         run: pip install pyinstaller -r requirements.txt
 
       - name: Build
-        if: steps.ver.outputs.skip != 'true'
         run: python -m PyInstaller hagibis-monitor.spec --clean --noconfirm
 
-      - name: Package
-        if: steps.ver.outputs.skip != 'true'
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
         run: |
-          TAG="${{ steps.ver.outputs.tag }}"
+          TAG="${{ needs.resolve.outputs.tag }}"
           ARCHIVE="hagibis-monitor-${TAG}-linux-x86_64.tar.gz"
           mkdir staging
           cp dist/hagibis-monitor hagibis-monitor.desktop install.sh staging/
           tar -czf "$ARCHIVE" -C staging .
-          echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          TAG="${{ needs.resolve.outputs.tag }}"
+          ARCHIVE="hagibis-monitor-${TAG}-windows-x86_64.zip"
+          # 7z is preinstalled on the runner and on PATH; Git Bash has no `zip`.
+          7z a "$ARCHIVE" ./dist/hagibis-monitor.exe ./README.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.artifact }}
+          path: |
+            *.tar.gz
+            *.zip
+          if-no-files-found: error
+
+  # ── create the release only after BOTH builds succeed ──────────────────────
+  release:
+    needs: [resolve, build]
+    if: needs.resolve.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
 
       - name: Create release
-        if: steps.ver.outputs.skip != 'true'
         uses: softprops/action-gh-release@v2
         with:
-          # Create the tag here, atomically with the release, only after the
-          # build and package steps have succeeded — so a build failure can't
-          # leave a dangling tag that permanently wedges the version number.
-          tag_name: ${{ steps.ver.outputs.tag }}
+          # Create the tag here, atomically with the release, only after both
+          # build legs have succeeded — so a build failure on either platform
+          # can't leave a dangling tag that permanently wedges the version.
+          tag_name: ${{ needs.resolve.outputs.tag }}
           target_commitish: ${{ github.sha }}
-          files: ${{ env.ARCHIVE }}
+          files: |
+            *.tar.gz
+            *.zip
           generate_release_notes: true

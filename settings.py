@@ -1,4 +1,37 @@
+import sys
 from dataclasses import dataclass
+
+from PyQt6.QtCore import QSettings
+
+IS_WINDOWS = sys.platform == "win32"
+
+# Per-platform default capture devices. On Linux these are the well-known V4L2 /
+# ALSA addresses. Windows has no stable well-known name (DirectShow devices are
+# friendly-name strings), so the default is empty, meaning "auto — use the first
+# enumerated device". ui.py treats an empty saved value as "first available" and
+# suppresses the missing-device warning for it.
+_DEFAULT_VIDEO_DEVICE = "" if IS_WINDOWS else "/dev/video0"
+_DEFAULT_AUDIO_DEVICE = "" if IS_WINDOWS else "plughw:Hagibis,0"
+
+
+def global_qsettings() -> QSettings:
+    """The single global settings store, constructed correctly per-platform.
+
+    On Linux the historical NativeFormat store (``~/.config/HagibisMonitor/
+    HagibisMonitor.conf``) is kept so existing users' settings never move.
+    On Windows NativeFormat is the *registry*, which would make
+    ``QSettings.fileName()`` a registry path and break ``_profiles_dir()`` — so
+    Windows uses an explicit IniFormat/UserScope store at
+    ``%APPDATA%\\HagibisMonitor\\HagibisMonitor.ini``, next to which the
+    ``profiles/`` directory can live.
+
+    Note: ``setDefaultFormat(IniFormat)`` is deliberately NOT used — it only
+    affects the parent-less constructor, not ``QSettings(org, app)``.
+    """
+    if IS_WINDOWS:
+        return QSettings(QSettings.Format.IniFormat, QSettings.Scope.UserScope,
+                         "HagibisMonitor", "HagibisMonitor")
+    return QSettings("HagibisMonitor", "HagibisMonitor")
 
 
 # ── fallback tables used when v4l2-ctl is unavailable ────────────────────────
@@ -56,7 +89,7 @@ class AppSettings:
     crop_mode:     str   = "full"
     bg_color:      str   = "#1f1f1f"
     # Capture
-    video_device:  str   = "/dev/video0"
+    video_device:  str   = _DEFAULT_VIDEO_DEVICE
     video_fmt:     str   = "mjpeg"
     video_res:     str   = "1280x720"
     video_fps:     int   = 30
@@ -65,7 +98,7 @@ class AppSettings:
     saturation:    int   = 50
     hue:           int   = 50
     # Audio
-    audio_device:  str   = "plughw:Hagibis,0"
+    audio_device:  str   = _DEFAULT_AUDIO_DEVICE
     audio_enabled: bool  = True
     mono_mix:      bool  = False
     passthrough:   bool  = False

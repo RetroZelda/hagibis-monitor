@@ -2,10 +2,26 @@ import os
 import queue
 import threading
 import subprocess
+import sys
 import time
 import numpy as np
 from PyQt6.QtCore import QThread, QRectF, pyqtSignal
 from PyQt6.QtGui import QColor, QImage, QPainter
+
+_IS_WINDOWS = sys.platform == "win32"
+# Prevent a console window flashing on each ffmpeg spawn under the windowed
+# (console=False) Windows build.
+_NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if _IS_WINDOWS else {}
+
+# sounddevice provides Windows audio *output* (ffmpeg has no output device on
+# Windows). Guarded so a missing package degrades to VU-only instead of crashing.
+if _IS_WINDOWS:
+    try:
+        import sounddevice as _sd
+    except Exception:
+        _sd = None
+else:
+    _sd = None
 
 
 class VideoWorker(QThread):
@@ -46,20 +62,30 @@ class VideoWorker(QThread):
 
     def run(self):
         self._running = True
-        cmd = [
-            "ffmpeg", "-loglevel", "quiet",
-            "-f", "v4l2",
-            "-input_format", self.input_format,
-            "-video_size", f"{self.width}x{self.height}",
-            "-framerate", str(self.fps),
-            "-i", self.device,
-            "-f", "rawvideo",
-            "-pix_fmt", "rgb24",
-            "-",
-        ]
+        if _IS_WINDOWS:
+            cmd = ["ffmpeg", "-loglevel", "quiet", "-f", "dshow",
+                   # dshow's ~3 MB default real-time buffer is smaller than one
+                   # uncompressed yuyv422 1080p frame (4.15 MB) and would drop
+                   # whole frames; 64 MB gives ample headroom.
+                   "-rtbufsize", "64M"]
+            if self.input_format == "mjpeg":
+                cmd += ["-vcodec", "mjpeg"]
+            else:  # yuyv422 and other raw formats select via -pixel_format
+                cmd += ["-pixel_format", self.input_format]
+            cmd += ["-video_size", f"{self.width}x{self.height}",
+                    "-framerate", str(self.fps),
+                    "-i", f"video={self.device}"]
+        else:
+            cmd = ["ffmpeg", "-loglevel", "quiet", "-f", "v4l2",
+                   "-input_format", self.input_format,
+                   "-video_size", f"{self.width}x{self.height}",
+                   "-framerate", str(self.fps),
+                   "-i", self.device]
+        cmd += ["-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
         try:
             self._proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
+                **_NO_WINDOW,
             )
         except FileNotFoundError:
             self.error.emit("ffmpeg not found")
@@ -314,6 +340,7 @@ class AudioWorker(QThread):
         self._running    = False
         self._proc       = None
         self._pacat_proc = None
+        self._out_stream = None  # Windows: sounddevice passthrough output stream
         self._bus_mod: int | None = None
         self._src_mod: int | None = None
 
@@ -440,10 +467,21 @@ class AudioWorker(QThread):
     # ── ffmpeg command ────────────────────────────────────────────────────────
 
     def _build_cmd(self, virt_fd: int | None = None) -> list[str]:
+        mono_filter = "pan=stereo|c0=0.5*c0+0.5*c1|c1=0.5*c0+0.5*c1" if self.mono_mix else ""
+
+        if _IS_WINDOWS:
+            # Single pipe on Windows — ffmpeg has no audio output device here, so
+            # passthrough is played from Python (sounddevice) off the same PCM.
+            # A smaller dshow audio buffer keeps VU + passthrough responsive.
+            cmd = ["ffmpeg", "-loglevel", "quiet", "-f", "dshow",
+                   "-audio_buffer_size", "50", "-i", f"audio={self.device}"]
+            if mono_filter:
+                cmd += ["-af", mono_filter]
+            cmd += ["-f", "s16le", "-ar", str(self.SAMPLE_RATE), "-ac", "2", "pipe:1"]
+            return cmd
+
         fmt  = "alsa" if self.device.startswith(("hw:", "plughw:")) else "pulse"
         base = ["ffmpeg", "-loglevel", "quiet", "-f", fmt, "-i", self.device]
-
-        mono_filter = "pan=stereo|c0=0.5*c0+0.5*c1|c1=0.5*c0+0.5*c1" if self.mono_mix else ""
 
         if not self.passthrough and not self.virtual_output:
             cmd = base[:]
@@ -478,6 +516,12 @@ class AudioWorker(QThread):
     def run(self):
         self._running = True
 
+        # Virtual mic is Linux-only (PulseAudio null-sink + POSIX os.pipe/pass_fds).
+        # Force it off on Windows so that path is never entered even if a stale
+        # profile flag slips through.
+        if _IS_WINDOWS:
+            self.virtual_output = False
+
         if self.virtual_output and not self._create_virtual_source():
             self.error.emit("Failed to create virtual microphone — is PulseAudio/PipeWire running?")
             self.virtual_output = False
@@ -509,6 +553,7 @@ class AudioWorker(QThread):
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 pass_fds=(virt_fd,) if virt_fd is not None else (),
                 bufsize=0,
+                **_NO_WINDOW,
             )
         except FileNotFoundError:
             self.error.emit("ffmpeg not found")
@@ -517,6 +562,23 @@ class AudioWorker(QThread):
         finally:
             if virt_fd is not None:
                 os.close(virt_fd)  # ffmpeg owns the write end now
+
+        # Windows passthrough: play captured audio to the default output device
+        # ourselves (ffmpeg has no audio output device on Windows). The same
+        # gained PCM computed for the VU meters is written here, so the volume
+        # sliders affect speaker level instantly with no extra machinery.
+        if _IS_WINDOWS and self.passthrough:
+            if _sd is None:
+                self.error.emit("Passthrough needs the 'sounddevice' package (pip install sounddevice)")
+            else:
+                try:
+                    self._out_stream = _sd.RawOutputStream(
+                        samplerate=self.SAMPLE_RATE, channels=2, dtype="int16",
+                        blocksize=0, latency="low")  # if it crackles: latency=None
+                    self._out_stream.start()
+                except Exception as e:
+                    self._out_stream = None
+                    self.error.emit(f"Audio passthrough unavailable: {e}")
 
         chunk_size = self.CHUNK_FRAMES * 2 * 2  # 2 ch × 2 bytes (s16le)
 
@@ -536,6 +598,15 @@ class AudioWorker(QThread):
             r_gain = 10.0 ** ((self.volume_db + self.volume_r_db) / 20.0)
             samples[:, 0] *= l_gain
             samples[:, 1] *= r_gain
+            if self._out_stream is not None:
+                # Blocking write paces naturally against the real-time capture.
+                # RMS below still uses the unclipped float array for headroom.
+                try:
+                    pcm = np.clip(samples, -32768.0, 32767.0).astype(np.int16)
+                    self._out_stream.write(pcm.tobytes())
+                except Exception:
+                    self._close_out_stream()
+                    self.error.emit("Audio output device lost — passthrough stopped")
             l_rms = np.sqrt(np.mean(samples[:, 0] ** 2))
             r_rms = np.sqrt(np.mean(samples[:, 1] ** 2))
             l_db = 20.0 * np.log10(l_rms / 32768.0) if l_rms > 0 else -96.0
@@ -553,6 +624,10 @@ class AudioWorker(QThread):
                 msg = stderr.splitlines()[-1] if stderr else f"ffmpeg exited ({self._proc.returncode})"
                 self.error.emit(msg)
 
+        # Close the passthrough output stream on this thread (stop() never
+        # touches it, so there are no cross-thread PortAudio calls).
+        self._close_out_stream()
+
         # Stop pacat but leave the PA modules loaded so OBS keeps the device.
         if self._pacat_proc is not None:
             self._pacat_proc.terminate()
@@ -561,6 +636,15 @@ class AudioWorker(QThread):
             except subprocess.TimeoutExpired:
                 self._pacat_proc.kill()
             self._pacat_proc = None
+
+    def _close_out_stream(self):
+        if self._out_stream is not None:
+            try:
+                self._out_stream.abort()  # drop buffered audio, don't block draining
+                self._out_stream.close()
+            except Exception:
+                pass
+            self._out_stream = None
 
     def teardown(self):
         """Unload the virtual PulseAudio source. Call only when virtual output is being disabled."""

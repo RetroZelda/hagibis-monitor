@@ -146,10 +146,21 @@ flowchart TD
 
 ## What this project is
 
-A PyQt6 GUI monitor for USB capture cards on a Linux desktop. Not a recording
-tool — purely live monitoring, image control, optional audio passthrough,
-virtual camera output (v4l2loopback), and virtual microphone (PulseAudio).
-All settings are organised into named profiles.
+A PyQt6 GUI monitor for USB capture cards. Not a recording tool — purely live
+monitoring, image control, optional audio passthrough, virtual camera output
+(v4l2loopback), and virtual microphone (PulseAudio). All settings are organised
+into named profiles.
+
+**Cross-platform since v1.3.0.** Linux is the primary platform with the full
+feature set. Windows is supported for live monitoring (video preview, capture
+selection, image controls, audio VU/passthrough, screen-wake) but **not** the
+virtual camera or virtual microphone — those depend on v4l2loopback and
+PulseAudio, which have no Windows equivalent, and the Output tab shows a
+placeholder there. The rule is **branch only at OS-specific points**: each leaf
+module keeps a `_IS_WINDOWS = sys.platform == "win32"` constant and dispatches
+per-function to `_impl_linux()` / `_impl_windows()` bodies, keeping public
+names, signatures, and the flat module layout unchanged. See
+[Cross-platform design](#cross-platform-design).
 
 ## Code organisation
 
@@ -160,14 +171,16 @@ for the full file tree):
 |---|---|
 | `main.py` | Entry point only — `QApplication` + `MainWindow` |
 | `ui.py` | `MainWindow` (everything UI-side) + `_StatusBar` |
-| `video.py` | `VideoDisplay` widget + V4L2 device scanning / cap query |
-| `audio.py` | PulseAudio / ALSA device scanning |
-| `output.py` | v4l2loopback discovery / load / unload + `_ModprobeWorker` |
-| `settings.py` | `AppSettings` + `OutputSettings` dataclasses + constant tables |
+| `video.py` | `VideoDisplay` widget + device scanning / cap query (V4L2 or dshow) |
+| `audio.py` | Audio device scanning (PulseAudio/ALSA on Linux, dshow on Windows) |
+| `output.py` | v4l2loopback discovery / load / unload + `_ModprobeWorker` (**Linux only**) |
+| `camera_controls.py` | Windows image controls via DirectShow `IAMVideoProcAmp` (`comtypes`) |
+| `settings.py` | `AppSettings` + `OutputSettings` dataclasses, constant tables, `global_qsettings()`, platform default-device constants |
 | `utils.py` | Small shared helpers (`_dev_key`, `_aspect_label`, `_sbin`, `_slider_row`, `_db_label`) |
 | `workers.py` | `VideoWorker`, `AudioWorker`, `OutputWorker` — all three `QThread` subprocess drivers |
 | `vu_meter.py` | `VuMeter`, `DbScale`, `StereoVuMeter` |
-| `power.py` | `ScreenWakeInhibitor` — keeps the screen awake while the app is open |
+| `power.py` | `ScreenWakeInhibitor` — keeps the screen awake (D-Bus/systemd on Linux, `SetThreadExecutionState` on Windows) |
+| `build.py` | Cross-platform build script (venv + PyInstaller); `build.sh` is a thin wrapper |
 
 `MainWindow` in `ui.py` is intentionally monolithic — it owns every widget
 and every worker, and orchestrates profile load/save, stream restarts,
@@ -181,12 +194,13 @@ controllers, which would be a behavioural change rather than reorganisation.
 flowchart TD
     main[main.py<br/>entry point]
     ui[ui.py<br/>MainWindow + _StatusBar]
-    video[video.py<br/>VideoDisplay + v4l2-ctl scan]
-    audio[audio.py<br/>pactl / arecord scan]
+    video[video.py<br/>VideoDisplay + V4L2/dshow scan]
+    audio[audio.py<br/>pactl / arecord / dshow scan]
     output[output.py<br/>v4l2loopback + _ModprobeWorker]
+    camctl[camera_controls.py<br/>Windows IAMVideoProcAmp]
     workers[workers.py<br/>VideoWorker / AudioWorker / OutputWorker]
     vu[vu_meter.py<br/>VuMeter / DbScale / StereoVuMeter]
-    settings[settings.py<br/>AppSettings / OutputSettings + const tables]
+    settings[settings.py<br/>AppSettings / OutputSettings + const tables + QSettings factory]
     utils[utils.py<br/>_dev_key / _aspect_label / _sbin / _slider_row / _db_label]
     power[power.py<br/>ScreenWakeInhibitor]
 
@@ -195,6 +209,7 @@ flowchart TD
     ui --> audio
     ui --> power
     ui --> output
+    ui --> camctl
     ui --> workers
     ui --> vu
     ui --> settings
@@ -203,9 +218,11 @@ flowchart TD
 ```
 
 Notes:
-- `workers.py`, `vu_meter.py`, `video.py`, `audio.py`, `settings.py`, and
-  `power.py` have no project-local imports — they only depend on PyQt6, numpy,
-  and stdlib.
+- `workers.py`, `vu_meter.py`, `video.py`, `audio.py`, `settings.py`,
+  `power.py`, and `camera_controls.py` have no project-local imports — they only
+  depend on PyQt6, numpy, stdlib, and (Windows-only, guarded) `sounddevice` /
+  `comtypes`. `settings.py` additionally imports `PyQt6.QtCore` for the
+  `QSettings` factory.
 - Only `ui.py` reaches across modules to wire things together; nothing
   outside `ui.py` depends on `MainWindow`.
 
@@ -257,6 +274,90 @@ flowchart LR
 Three long-lived ffmpeg subprocesses (video, audio, output); one per worker.
 Workers communicate back to the main thread exclusively via Qt signals.
 
+## Cross-platform design
+
+The one rule: **branch only at OS-specific points; keep everything else shared.**
+
+- **Dispatch idiom.** Each leaf module defines `_IS_WINDOWS = sys.platform ==
+  "win32"` and, where behaviour differs, keeps the original body as
+  `_thing_linux()` and adds `_thing_windows()`, with the public function
+  dispatching. `power.py` is the exception: it splits at the *top level*
+  (`if sys.platform == "win32":`) so `PyQt6.QtDBus` is never imported on Windows
+  (that import isn't present in every Windows PyQt6 wheel and would crash the
+  app). No `platform_win.py` module — that would force a project-local import
+  into the leaf modules and break the dependency graph.
+- **Windows capture.** `VideoWorker` / `AudioWorker` swap `-f v4l2` / `-f alsa`
+  for `-f dshow -i video=…` / `-i audio=…`. Video needs `-rtbufsize 64M` (dshow's
+  ~3 MB default is smaller than one yuyv 1080p frame). Device enumeration/caps
+  come from parsing ffmpeg's `-list_devices` / `-list_options` **stderr**
+  (exit code is non-zero — parse regardless); the log prefix varies by version
+  so regexes anchor on a generic `^\[[^\]]+\]`.
+- **Single-pipe Windows audio.** ffmpeg has no audio *output* device on Windows,
+  so there is **no `asplit`** — one s16le pipe to stdout, and passthrough is
+  played from Python via `sounddevice` (WASAPI) using the *same gained PCM* the
+  VU meters use. One consequence: the volume sliders affect speaker level
+  instantly with no `pactl`-equivalent machinery, and `virtual_output` is forced
+  off on Windows (the pacat/`os.pipe`/`pass_fds` path is POSIX-only).
+- **Device identity.** Devices are addressed by DirectShow friendly name
+  (readable in INI, survives replug — same spirit as Linux `plughw:Name`),
+  falling back to the stable `@device_pnp_…` alternative name only when a name
+  is duplicated. Windows default device is the empty string = "auto → first
+  enumerated"; `settings._DEFAULT_VIDEO_DEVICE` / `_DEFAULT_AUDIO_DEVICE` encode
+  this, and an empty saved value never triggers the missing-device warning.
+- **Image controls.** Linux shells `v4l2-ctl --set-ctrl`; Windows uses
+  `camera_controls.py` (DirectShow `IAMVideoProcAmp` via `comtypes` — **not**
+  `duvc-ctl`, which has no wheel for recent Pythons and a broken sdist). The
+  0–100 UI value maps onto each control's device-defined range; unsupported
+  controls disable their slider. `_set_v4l2`/`_apply_v4l2_all` in `ui.py` keep
+  their names and are the single dispatch seam.
+- **QSettings.** `settings.global_qsettings()` returns the store correctly per
+  OS: Linux keeps NativeFormat (`~/.config/HagibisMonitor/HagibisMonitor.conf`,
+  unchanged for existing users); Windows forces IniFormat/UserScope
+  (`%APPDATA%\HagibisMonitor\HagibisMonitor.ini`) so `fileName()` is a real path
+  and `_profiles_dir()` resolves (NativeFormat on Windows is the registry). All
+  global-settings sites route through this factory. **Never** use
+  `setDefaultFormat` — it doesn't affect the `(org, app)` constructor.
+- **Screen-wake.** `SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED
+  | ES_SYSTEM_REQUIRED)` on Windows; must be driven from one thread (the UI
+  thread, which is already the case).
+- **No console flashes.** Every `subprocess` spawn in `video.py` / `audio.py` /
+  `workers.py` passes `**_NO_WINDOW` (`creationflags=CREATE_NO_WINDOW` on
+  Windows) so ffmpeg doesn't flash a console under the windowed build.
+- **Output feature gating.** The real Output widget tree is always built (≈15
+  methods reference its widgets, and a profile re-saved on Windows must
+  round-trip `output/*` + pan/zoom), but on Windows it isn't added to the tab
+  widget — a placeholder tab is shown instead, and `OutputWorker` /
+  `_ModprobeWorker` can never be constructed.
+
+## Build & release (cross-platform)
+
+- **`build.py`** is the single entry point: detects the OS, creates
+  `.venv-build` (`Scripts/` vs `bin/`), installs `pyinstaller -r
+  requirements.txt`, runs the spec. `build.sh` is a 4-line wrapper calling it.
+- **`hagibis-monitor.spec`** gates on `IS_WINDOWS`: hidden imports
+  (`sounddevice`+`comtypes` on Windows, `PyQt6.QtDBus` on Linux), `upx=not
+  IS_WINDOWS` (AV/CFG issues), `console=not IS_WINDOWS` (Windows is windowed;
+  errors surface in-UI). No icon asset yet.
+- **`requirements.txt`** uses PEP 508 markers for the Windows-only deps
+  (`sounddevice`, `comtypes` — both guarded in code, so a missing one degrades
+  rather than crashes).
+- **CI** (`release.yml`) is three jobs — `resolve` reads the version + skip
+  decision once on Linux, `build` is a Linux+Windows matrix (`fail-fast: true`),
+  `release` runs only after **both** builds succeed. The tag is created
+  atomically in the release step, so a failed leg never leaves a dangling tag.
+
+```mermaid
+flowchart LR
+    R["resolve (ubuntu)<br/>actor gate · version<br/>· tag-exists → skip"]
+    BL["build / ubuntu<br/>apt Qt libs + upx<br/>→ tar.gz"]
+    BW["build / windows<br/>→ zip (7z)"]
+    REL["release (ubuntu)<br/>download both<br/>→ gh-release (tag here)"]
+    R -->|skip != true| BL
+    R -->|skip != true| BW
+    BL --> REL
+    BW --> REL
+```
+
 ## Settings / profile system
 
 All profile-able state lives in the `AppSettings` dataclass (flat, no nesting).
@@ -269,10 +370,16 @@ _save_to_disk(settings, profile_name)  # struct → INI file (single QSettings o
 settings = _load_from_disk(name)       # INI file → struct
 ```
 
-Profile INI files live in `~/.config/HagibisMonitor/profiles/`. The main
-`HagibisMonitor.ini` stores window geometry and output settings (device,
-resolution, pixel format, fps). **Never write profile data to the global
-QSettings** — it breaks the profile separation.
+Profile INI files live next to the global settings store — under
+`~/.config/HagibisMonitor/profiles/` on Linux and
+`%APPDATA%\HagibisMonitor\profiles\` on Windows (see
+[Cross-platform design](#cross-platform-design) for how `global_qsettings()`
+makes both resolve). The main global store (`HagibisMonitor.conf` on Linux,
+`HagibisMonitor.ini` on Windows) holds window geometry and output settings
+(device, resolution, pixel format, fps). **Never write profile data to the
+global QSettings** — it breaks the profile separation. Always obtain the global
+store via `settings.global_qsettings()`, never `QSettings("HagibisMonitor",
+"HagibisMonitor")` directly.
 
 Output is always loaded with `enabled=False` regardless of the saved value.
 
@@ -284,7 +391,7 @@ class AppSettings:
     scale_mode: str = "fit"
     crop_mode: str = "full"
     bg_color: str = "#1f1f1f"
-    video_device: str = "/dev/video0"
+    video_device: str = _DEFAULT_VIDEO_DEVICE   # "/dev/video0" on Linux, "" (auto) on Windows
     video_fmt: str = "mjpeg"
     video_res: str = "1280x720"
     video_fps: int = 30
@@ -292,7 +399,7 @@ class AppSettings:
     contrast: int = 50
     saturation: int = 50
     hue: int = 50
-    audio_device: str = "plughw:Hagibis,0"
+    audio_device: str = _DEFAULT_AUDIO_DEVICE   # "plughw:Hagibis,0" on Linux, "" (auto) on Windows
     audio_enabled: bool = True
     mono_mix: bool = False
     passthrough: bool = False
@@ -372,18 +479,28 @@ class AppSettings:
   the writer closing before a new writer connects), then starts a new worker
   at the new resolution.
 - **Screen-wake inhibitor (`power.py`)** — `MainWindow` holds a
-  `ScreenWakeInhibitor`. It calls the freedesktop `org.freedesktop.ScreenSaver`
-  D-Bus `Inhibit`/`UnInhibit` (via `QtDBus`) — the same lock video players use —
-  and falls back to a `systemd-inhibit` idle/sleep block. The lock is
+  `ScreenWakeInhibitor`. On Linux it calls the freedesktop
+  `org.freedesktop.ScreenSaver` D-Bus `Inhibit`/`UnInhibit` (via `QtDBus`) — the
+  same lock video players use — and falls back to a `systemd-inhibit`
+  idle/sleep block; on Windows it uses `SetThreadExecutionState` (the module
+  splits at the top level so QtDBus isn't imported there). The lock is
   session-scoped (held whenever the app is open, even minimized or with no
   signal). It is controlled by the **"Keep screen awake while running"**
   checkbox on the Video tab, a **global** setting stored at `power/keep_awake`
-  in `HagibisMonitor.ini` (default on) — NOT per-profile, so switching profiles
+  in the global store (default on) — NOT per-profile, so switching profiles
   never changes it. `__init__` applies it via `_apply_screen_wake(...)` after
   `_load_settings()`; `_on_keep_awake_changed` persists and applies it live;
   `closeEvent` calls `release()` unconditionally (safe no-op if not held). If a
   future change should tie it to active video instead, gate
   `_apply_screen_wake()` on `_start_video()`/`_stop_video()`.
+- **Cross-platform: branch only at OS-specific points.** The full rationale for
+  the dispatch idiom, Windows capture/audio/image-control/screen-wake/QSettings
+  choices, and the build/CI shape lives in
+  [Cross-platform design](#cross-platform-design) and
+  [Build & release](#build--release-cross-platform). Key gotcha for future work:
+  Windows image controls use `comtypes` (DirectShow `IAMVideoProcAmp`), **not**
+  `duvc-ctl` — the latter ships no wheel for recent Pythons and its sdist build
+  is broken; `camera_controls.py` insulates the choice behind four functions.
 
 ## Things not yet implemented
 
@@ -396,12 +513,13 @@ class AppSettings:
 ## Hardware constants (defaults, all overridable via UI)
 
 ```python
+# Linux defaults; on Windows both default to "" (auto → first enumerated device)
 AppSettings.video_device  = "/dev/video0"
 AppSettings.audio_device  = "plughw:Hagibis,0"
 AudioWorker.SAMPLE_RATE   = 48000
 AudioWorker.CHUNK_FRAMES  = 1024
-AudioWorker.BUS_SINK      = "hagibis_bus"
-AudioWorker.SOURCE_NAME   = "hagibis_virtual"
+AudioWorker.BUS_SINK      = "hagibis_bus"       # Linux virtual mic only
+AudioWorker.SOURCE_NAME   = "hagibis_virtual"   # Linux virtual mic only
 ```
 
 ## How to restart streams from code

@@ -1,2 +1,6 @@
 PyQt6>=6.4.0
 numpy>=1.24.0
+# Windows-only runtime deps (audio output + UVC image controls). PEP 508
+# environment markers — pip skips these on Linux, installs them on Windows.
+sounddevice>=0.4.6; sys_platform == "win32"
+comtypes>=1.4.0; sys_platform == "win32"
